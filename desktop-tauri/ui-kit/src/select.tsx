@@ -40,6 +40,12 @@ function SelectTrigger({ className, children, ...props }: SelectTriggerProps) {
       data-slot='select-trigger'
       className={cn(
         'inline-flex h-[30px] min-w-0 cursor-pointer items-center justify-between gap-1.5 rounded-md border border-control-border bg-control px-2.5',
+        // 选中值（SelectValue 渲染出的 span）是触发器的 flex 子项，默认
+        // min-width:auto 不收缩：标签比触发器宽时会把边框撑破、文字溢出去
+        // （账号表代理列实测）。truncate 把 overflow 变 hidden，自动最小尺寸
+        // 随之归零，过长标签省略号收口 —— 完整值在展开的浮层与触发器的 title 里。
+        // 这条选择器会连箭头图标的 span 一起命中，truncate 不改 display，对它无影响。
+        '[&>span]:min-w-0 [&>span]:truncate',
         'text-[12.5px] font-normal text-foreground',
         'transition-colors duration-150 ease-out',
         'hover:border-control-border-hover hover:bg-control-hover',
@@ -68,7 +74,15 @@ type SelectContentProps = Omit<React.ComponentProps<typeof BaseSelect.Popup>, 'c
 function SelectContent({ className, sideOffset = 4, children, ...props }: SelectContentProps) {
   return (
     <BaseSelect.Portal>
-      <BaseSelect.Positioner sideOffset={sideOffset} className='z-[35]'>
+      {/* alignItemWithTrigger={false}：关闭 Base UI 默认的「选中项对齐触发器」定位。
+          那个模式由组件自己接管弹层的高度与 top/bottom（fixed + 从视口顶边起算），
+          与我们在 Popup 上写的 max-h 固定上限互相打架：当选中项落在长列表深处、
+          触发器又靠近视口底部时（账号页代理列实测 —— 轮询账号的补位项排在
+          40+ 项的末尾），弹层会被钉到视口顶部，离触发器十万八千里。
+          关掉后回到标准锚定定位：贴着触发器下方弹出、空间不够向上翻转，
+          弹层内部自行滚动到选中项。官方对默认模式的说明与关闭方式见
+          base-ui.com/react/components/select 的 Positioning 一节。 */}
+      <BaseSelect.Positioner sideOffset={sideOffset} alignItemWithTrigger={false} className='z-[35]'>
         <BaseSelect.Popup
           data-slot='select-content'
           className={cn(

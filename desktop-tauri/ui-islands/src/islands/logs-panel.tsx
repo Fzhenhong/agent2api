@@ -2,10 +2,17 @@ import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   Badge, Button, InputGroup, InputGroupAddon, InputGroupInput,
-  Pager,
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
   SegmentedControl, type SegmentedControlOption,
 } from '@ui'
+import {
+  CLIENT_PAGE_SIZES,
+  TableFooter,
+  readPageSize,
+  writePageSize,
+  type PageSizeChoice,
+} from './table-shell'
+import { t } from '../i18n'
 
 /**
  * Agent2API · 系统事件日志面板（筛选 / 分页 / 导出 / 清空）—— React 岛。
@@ -35,8 +42,8 @@ import {
  * Tailwind 会让这一页与其它页长得不一样（样式在 ui/css/page-logs.css 与 layout.css）。控件一律
  * 换：button → Button、`.badge` → Badge、原生 `<select>` → Select 一族、搜索框 → InputGroup 一族
  * （图标 ⌕，与 input-control.tsx 用法一致）、时间档位 → SegmentedControl（不再调 wbSegmented，
- * 也不再留 `#logs-range` 那个挂载点）、分页栏 → Pager（`.log-pager` / `.log-pager-info` 随之退场，
- * 边界判断与读数收在组件里，与请求日志页同一口径）。
+ * 也不再留 `#logs-range` 那个挂载点）、分页栏 → 通用表格页脚（islands/table-shell.tsx：
+ * 读数 / 每页条数 / 跳页 / 翻页器五张表一套，边界判断与读数收在组件里）。
  *
  * ── 坑：带 Tailwind display 工具类的元素上 hidden 无效 ─────────
  * 组件库的工具类是**分层 + !important** 的，tokens.css 的 `[hidden] { display:none !important }`
@@ -136,8 +143,12 @@ function toast(message: string, kind?: 'err' | 'ok'): void {
 
 /** 自动刷新间隔兜底值（毫秒），1 秒 = 后端默认间隔（`DEFAULT_LOGS_AUTO_REFRESH_SECONDS`） */
 const DEFAULT_AUTO_REFRESH_MS = 1_000
-/** 事件日志每页条数 */
-const PAGE_SIZE = 50
+/**
+ * 每页条数的档位：本页是**客户端分页**（一次拉满 FETCH_LIMIT 条，翻页只重绘、
+ * 不打接口），所以给到「全部」这一档也没有额外开销 —— 与请求日志（服务端真分页、
+ * 没有「全部」）的差别就在这里，见 table-shell 的文件头。
+ */
+const PAGE_SIZES = CLIENT_PAGE_SIZES
 /** 系统事件单次拉取上限（后端上限）：一次拿全，总页数才对得上真实结果 */
 const FETCH_LIMIT = 500
 /** 时间档位的持久化键（请求日志页的档位在 requests-panel，两键独立） */
@@ -156,29 +167,33 @@ const DEFAULT_FILE = '~/.agent2api/logs.jsonl'
  */
 const RANGES: readonly string[] = ['today', '7', '30', 'month', 'all']
 const DEFAULT_RANGE = 'all'
-/** 分段控件上的**短**标签（与报表页的摘要文字「近 7 天」是两套，别合并：控件里位置窄） */
+/**
+ * 分段控件上的**短**标签（与报表页的摘要文字「近 7 天」是两套，别合并：控件里位置窄）。
+ * 数组的 value 是持久化的档位字面量、绝不翻译；label 走 t()。
+ */
 const RANGE_OPTION_LABEL: Record<string, string> = {
-  today: '今天', 7: '7 天', 30: '30 天', month: '本月', all: '全部',
+  today: t('今天'), 7: t('7 天'), 30: t('30 天'), month: t('本月'), all: t('全部'),
 }
-/** 选项提到模块级：SegmentedControl 每拿到新数组都要重新量滑块位置，常量能省掉这轮测量 */
+/** 选项提到模块级：SegmentedControl 每拿到新数组都要重新量滑块位置，常量能省掉这轮测量。
+ *  （模块求值晚于 head 里的 i18n 词典注入，所以这里的 t() 拿得到译文。） */
 const RANGE_OPTIONS: readonly SegmentedControlOption<string>[] = RANGES.map(value => ({
   value, label: RANGE_OPTION_LABEL[value],
 }))
 
-/** 最低级别下拉的选项（与旧实现 index.html 里那四个 option 逐字一致） */
+/** 最低级别下拉的选项（与旧实现 index.html 里那四个 option 逐字一致；value 是后端参数，不译） */
 const LEVEL_OPTIONS: readonly { value: string; label: string }[] = [
-  { value: '', label: '全部级别' },
-  { value: 'debug', label: 'debug 及以上' },
-  { value: 'info', label: 'info 及以上' },
-  { value: 'warn', label: 'warn 及以上' },
-  { value: 'error', label: '仅 error' },
+  { value: '', label: t('全部级别') },
+  { value: 'debug', label: t('debug 及以上') },
+  { value: 'info', label: t('info 及以上') },
+  { value: 'warn', label: t('warn 及以上') },
+  { value: 'error', label: t('仅 error') },
 ]
-const ALL_LEVEL_LABEL = '全部级别'
-const ALL_CATEGORY_LABEL = '全部分类'
+const ALL_LEVEL_LABEL = t('全部级别')
+const ALL_CATEGORY_LABEL = t('全部分类')
 
-/** 级别中文名（日志行里那枚徽章的文案） */
+/** 级别中文名（日志行里那枚徽章的文案；键是后端 level 字面量，不译） */
 const LEVEL_LABEL: Record<string, string> = {
-  debug: '调试', info: '信息', warn: '警告', error: '错误',
+  debug: t('调试'), info: t('信息'), warn: t('警告'), error: t('错误'),
 }
 
 /* ─── 模块级状态（跨渲染的守卫、缓存与入口登记）────── */
@@ -316,14 +331,16 @@ function formatLogTime(ts?: number): string {
   return `${d.getFullYear()}-${date} ${clock}`
 }
 
-/** 附加数据渲染成简短后缀：429 切换显示「账号 A → 账号 B · 恢复时间」 */
+/** 附加数据渲染成简短后缀：429 切换显示「账号 A → 账号 B · 恢复时间」。
+ *  「模型」「恢复」是界面文案走 t()；模型名 / 恢复时间 / 状态码是后端数据，原样带入。
+ *  `HTTP 404` 整段没有中文（协议名 + 数字），不包 t()。 */
 function extraText(entry: LogEntry): string {
   const data = entry.data
   if (!data) return ''
   const parts: string[] = []
   if (data.from || data.to) parts.push([data.from, data.to].filter(Boolean).join(' → '))
-  if (data.model) parts.push(`模型 ${data.model}`)
-  if (data.resetAtText) parts.push(`${data.resetAtText} 恢复`)
+  if (data.model) parts.push(t('模型 {model}', { model: data.model }))
+  if (data.resetAtText) parts.push(t('{time} 恢复', { time: data.resetAtText }))
   else if (data.status && !data.from && !data.to) parts.push(`HTTP ${data.status}`)
   return parts.length ? parts.join(' · ') : ''
 }
@@ -334,8 +351,8 @@ function entriesOf(result: LogQueryResult | null | undefined): LogEntry[] {
 }
 
 /** 总页数按条目数算；日志被清空或筛选变严后页码会越界，夹回有效范围 */
-function clampPage(page: number, entries: LogEntry[]): number {
-  const pageCount = Math.max(1, Math.ceil(entries.length / PAGE_SIZE))
+function clampPage(page: number, entries: LogEntry[], size: PageSizeChoice): number {
+  const pageCount = Math.max(1, size === 'all' ? 1 : Math.ceil(entries.length / size))
   return Math.min(Math.max(1, page), pageCount)
 }
 
@@ -504,8 +521,8 @@ function fromResult(result: LogQueryResult | null | undefined, prev: PanelData):
 
 /** 空态文案：还没加载完 / 库里确实没有日志 / 有日志但筛不出来 */
 function emptyText(data: PanelData): string {
-  if (!data.loaded) return '正在加载日志…'
-  return data.total ? '没有符合筛选条件的日志' : '暂无日志'
+  if (!data.loaded) return t('正在加载日志…')
+  return data.total ? t('没有符合筛选条件的日志') : t('暂无日志')
 }
 
 function LogsPanel() {
@@ -514,6 +531,8 @@ function LogsPanel() {
   const [filters, setFilters] = React.useState<Filters>(readSavedFilters)
   const [range, setRange] = React.useState<string>(readRange)
   const [page, setPage] = React.useState(1)
+  /** 每页条数（页脚可换，存盘记住）：与 page 一样落一份 ref，异步回调读得到最新值 */
+  const [size, setSize] = React.useState<PageSizeChoice>(() => readPageSize('logs'))
   /** 在途操作：按钮文案与禁用都看它（互斥守卫读的是模块级 panelBusy） */
   const [busy, setBusy] = React.useState<{ which: 'clear' | 'export'; label: string } | null>(null)
   /** 自动刷新配置：挂载前的推送已经写在模块级变量里，这里取的就是最新的那份 */
@@ -537,6 +556,7 @@ function LogsPanel() {
   const filtersRef = React.useRef(filters)
   const rangeRef = React.useRef(range)
   const pageRef = React.useRef(page)
+  const sizeRef = React.useRef(size)
   const dataRef = React.useRef(data)
 
   const applyFilters = React.useCallback((patch: Partial<Filters>): Filters => {
@@ -547,6 +567,11 @@ function LogsPanel() {
   }, [])
   const applyRange = React.useCallback((next: string) => { rangeRef.current = next; setRange(next) }, [])
   const applyPage = React.useCallback((next: number) => { pageRef.current = next; setPage(next) }, [])
+  const applySize = React.useCallback((next: PageSizeChoice) => {
+    sizeRef.current = next
+    setSize(next)
+    writePageSize('logs', next)
+  }, [])
   const applyData = React.useCallback((next: PanelData) => { dataRef.current = next; setData(next) }, [])
 
   /** 补读上次会话的筛选（只做一次；见 readSavedFilters 的说明） */
@@ -577,14 +602,14 @@ function LogsPanel() {
     const pageBefore = pageRef.current
     try {
       const api = shared().workbuddyDesktop
-      if (!api) throw new Error('后端桥不可用')
+      if (!api) throw new Error(t('后端桥不可用'))
       const [result, nextStats] = await Promise.all([api.getLogs(query), api.getLogStats()])
       // 重写列表会把滚动弹回顶部：轮询刷新时把读到的位置还回去，否则每隔一个刷新周期就
       // 把正在看日志的人踢回页首。换筛选 / 页码被夹回则一律回顶。
       const keepTop = resetPage ? 0 : (listRef.current?.scrollTop ?? 0)
       const next = fromResult(result, dataRef.current)
       applyData(next)
-      applyPage(clampPage(pageRef.current, entriesOf(result)))
+      applyPage(clampPage(pageRef.current, entriesOf(result), sizeRef.current))
       pendingScrollRef.current = pageRef.current === pageBefore ? keepTop : 0
       applyStats(nextStats)
       // 存过的分类可能已经不在后端字典里（字典随版本变过）：旧实现那种情况下对原生 select 赋值
@@ -601,7 +626,7 @@ function LogsPanel() {
         console.warn('读取运行日志失败:', errorMessage(error))
         // 非静默失败按旧实现清成空态；silent 的轮询失败保留上一次的数据（别闪空）
         applyData(fromResult(null, dataRef.current))
-        applyPage(clampPage(pageRef.current, []))
+        applyPage(clampPage(pageRef.current, [], sizeRef.current))
       }
     }
   }, [applyData, applyPage, restoreSavedFilters])
@@ -611,7 +636,7 @@ function LogsPanel() {
     // 不带参数 = 只重绘（旧实现翻页时这么调）：React 里状态没变就没有重绘的必要
     if (result === undefined) return
     applyData(fromResult(result, dataRef.current))
-    applyPage(clampPage(pageRef.current, entriesOf(result)))
+    applyPage(clampPage(pageRef.current, entriesOf(result), sizeRef.current))
   }, [applyData, applyPage])
 
   /**
@@ -709,7 +734,7 @@ function LogsPanel() {
     try {
       await action()
     } catch (error) {
-      toast(`操作失败：${errorMessage(error)}`, 'err')
+      toast(t('操作失败：{error}', { error: errorMessage(error) }), 'err')
     } finally {
       panelBusy = false
       setBusy(null)
@@ -724,37 +749,39 @@ function LogsPanel() {
     const query = clearQuery(filtersRef.current, rangeRef.current)
     const hasFilters = query.length > 0
     const message = hasFilters
-      ? `确定清空当前筛选出的 <strong>${Number(dataRef.current.matched) || 0}</strong> 条日志？清空后无法恢复。`
-      : '确定清空<strong>全部</strong>运行日志？清空后无法恢复。'
+      ? t('确定清空当前筛选出的 <strong>{count}</strong> 条日志？清空后无法恢复。', { count: Number(dataRef.current.matched) || 0 })
+      : t('确定清空<strong>全部</strong>运行日志？清空后无法恢复。')
     const ask = shared().wbConfirm?.ask
     if (!ask) return
     // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），危险确认一律
     // 走自绘弹窗（wbConfirm）
-    if (!(await ask({ title: '清空运行日志', html: message, okText: '清空', okClass: 'danger' }))) return
-    await guard('clear', '清空中…', async () => {
+    if (!(await ask({ title: t('清空运行日志'), html: message, okText: t('清空'), okClass: 'danger' }))) return
+    await guard('clear', t('清空中…'), async () => {
       const api = shared().workbuddyDesktop
-      if (!api) throw new Error('后端桥不可用')
+      if (!api) throw new Error(t('后端桥不可用'))
       // 无筛选时显式带 all=1：后端要求「清空全部」必须显式声明，免得哪天参数漏传又被当成
       // 全清（前端写错一次就是全部数据没了）
       await api.clearLogs(hasFilters ? query : 'all=1')
       // 清空后没有「当前页」可言：回到第 1 页并把滚动位置一起归零
       await loadPanel({ resetPage: true })
-      toast('运行日志已清空')
+      toast(t('运行日志已清空'))
     })
   }
 
   /** 导出全部日志（不带筛选：导出走壳侧的 /api/logs/download） */
   async function exportLogs(): Promise<void> {
-    await guard('export', '导出中…', async () => {
+    await guard('export', t('导出中…'), async () => {
       const api = shared().workbuddyDesktop
-      if (!api) throw new Error('后端桥不可用')
+      if (!api) throw new Error(t('后端桥不可用'))
       const result = await api.exportLogs()
       if (!result || result.canceled) return
       if (result.count === 0) {
-        toast('暂无日志可导出', 'err')
+        toast(t('暂无日志可导出'), 'err')
         return
       }
-      toast(`✅ 已导出 ${result.count} 条日志到 ${result.file}`)
+      toast(t('✅ 已导出 {count} 条日志到 {file}', {
+        count: String(result.count), file: String(result.file),
+      }))
     })
   }
 
@@ -763,9 +790,22 @@ function LogsPanel() {
    * 新一页从顶部开始读，否则会停在上一页的滚动位置。
    */
   function gotoPage(target: number): void {
-    const next = clampPage(target, dataRef.current.entries)
+    const next = clampPage(target, dataRef.current.entries, sizeRef.current)
     if (next === pageRef.current) return
     applyPage(next)
+    pendingScrollRef.current = 0
+  }
+
+  /**
+   * 换每页条数：页码按「当前第一条」换算，用户不会被甩回第一页 ——
+   * 停在第 3 页（每页 50，即第 101 条）改成每页 100，应当落在第 2 页的第 101 条上。
+   */
+  function onSizeChange(next: PageSizeChoice): void {
+    if (next === sizeRef.current) return
+    const total = dataRef.current.entries.length
+    const first = total ? (pageRef.current - 1) * (sizeRef.current === 'all' ? total : sizeRef.current) : 0
+    applySize(next)
+    applyPage(next === 'all' ? 1 : Math.floor(first / next) + 1)
     pendingScrollRef.current = 0
   }
 
@@ -803,8 +843,15 @@ function LogsPanel() {
   /* ─── 渲染 ─────────────────────────────── */
 
   const entries = data.entries
-  const pageCount = Math.max(1, Math.ceil(entries.length / PAGE_SIZE))
-  const rows = entries.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const paged = size !== 'all'
+  const pageCount = Math.max(1, paged ? Math.ceil(entries.length / size) : 1)
+  const currentPage = Math.min(Math.max(1, page), pageCount)
+  const rows = paged
+    ? entries.slice((currentPage - 1) * size, currentPage * size)
+    : entries
+  /** 本页显示的区间（1 起闭区间）：给页脚的「当前第 a–b 条」用 */
+  const pageRangeStart = entries.length ? (paged ? (currentPage - 1) * size + 1 : 1) : 0
+  const pageRangeEnd = entries.length ? (paged ? pageRangeStart + rows.length - 1 : entries.length) : 0
   const categories = data.categories
 
   /**
@@ -813,8 +860,8 @@ function LogsPanel() {
    * 加载完之前保持骨架里那枚「—」。
    */
   const badgeText = data.matched === data.total
-    ? `${data.total} 条`
-    : `${data.matched} / ${data.total} 条`
+    ? t('{n} 条', { n: data.total })
+    : t('{matched} / {total} 条', { matched: data.matched, total: data.total })
 
   /** 顶栏那枚是本页徽标的镜像（app.js 的 renderTopbarStatus 按 id 读文案与配色）：文案一变
    *  就让它跟上，否则要等下一次主状态轮询（20 秒）才同步。 */
@@ -851,16 +898,16 @@ function LogsPanel() {
   return (
     <section className='panel' id='logs-panel-events'>
       <div className='panel-head'>
-        <h2>系统事件</h2>
+        <h2>{t('系统事件')}</h2>
         {/* id 保留：app.js 的 renderTopbarStatus 会按 id 镜像这枚徽标的文案与配色。
             data-tone 空串 = 无修饰（旧实现的 renderBadge 同样只写 'badge'、不带修饰）；
             有它 app.js 的 mirror 才会走 data-tone 分支，不去拆组件库 Badge 那串 Tailwind 类名。 */}
         <Badge id='logs-badge' variant='outline' data-tone=''>{data.loaded ? badgeText : '—'}</Badge>
         <div className='head-actions'>
           <Button id='btn-logs-export' variant='outline' disabled={busy !== null}
-            onClick={() => void exportLogs()}>{busyExport ? busy?.label : '导出'}</Button>
+            onClick={() => void exportLogs()}>{busyExport ? busy?.label : t('导出')}</Button>
           <Button id='btn-logs-clear' variant='destructive' disabled={busy !== null}
-            onClick={() => void clearLogs()}>{busyClear ? busy?.label : '清空'}</Button>
+            onClick={() => void clearLogs()}>{busyClear ? busy?.label : t('清空')}</Button>
         </div>
       </div>
 
@@ -870,13 +917,13 @@ function LogsPanel() {
               旧 CSS `.log-filters .seg { flex: 0 0 auto }` —— 新控件没有 .seg 类，那条规则成了死
               规则；不补的话窄窗口下它会被压扁，「本月」和「30 天」看着像同一个按钮。 */}
           <SegmentedControl options={RANGE_OPTIONS} value={range} onValueChange={onRangeChange}
-            aria-label='事件日志时间范围' className='shrink-0' />
+            aria-label={t('事件日志时间范围')} className='shrink-0' />
           {/* min-w-[120px] 补的是旧 CSS `.log-filters select { width:auto; min-width:120px }`：原生
               select 换成按钮触发器后那条规则不再命中，宽度锚要自己带。展示文案显式给 SelectValue
               （不依赖 value 自动显示）。 */}
           <Select value={filters.level} onValueChange={next => onSelectChange({ level: String(next ?? '') })}>
-            <SelectTrigger id='logs-level' className='min-w-[120px]' title='按最低级别筛选'
-              aria-label='按最低级别筛选'>
+            <SelectTrigger id='logs-level' className='min-w-[120px]' title={t('按最低级别筛选')}
+              aria-label={t('按最低级别筛选')}>
               <SelectValue>
                 {LEVEL_OPTIONS.find(item => item.value === filters.level)?.label ?? ALL_LEVEL_LABEL}
               </SelectValue>
@@ -888,8 +935,8 @@ function LogsPanel() {
             </SelectContent>
           </Select>
           <Select value={filters.category} onValueChange={next => onSelectChange({ category: String(next ?? '') })}>
-            <SelectTrigger id='logs-category' className='min-w-[120px]' title='按分类筛选'
-              aria-label='按分类筛选'>
+            <SelectTrigger id='logs-category' className='min-w-[120px]' title={t('按分类筛选')}
+              aria-label={t('按分类筛选')}>
               <SelectValue>
                 {filters.category ? (categories[filters.category] || filters.category) : ALL_CATEGORY_LABEL}
               </SelectValue>
@@ -908,8 +955,8 @@ function LogsPanel() {
               !important 的工具类盖掉，弹性由这里显式带。刻意**不带** data-island-input：那是
               输入框岛（就地升级）的钩子，两个岛同时挂一个输入框会打架。 */}
           <InputGroup className='w-auto flex-auto'>
-            <InputGroupInput id='logs-keyword' type='search' placeholder='搜索消息关键词…'
-              autoComplete='off' aria-label='搜索消息关键词' value={filters.keyword}
+            <InputGroupInput id='logs-keyword' type='search' placeholder={t('搜索消息关键词…')}
+              autoComplete='off' aria-label={t('搜索消息关键词')} value={filters.keyword}
               onChange={event => onKeywordChange(event.currentTarget.value)} />
             <InputGroupAddon aria-hidden='true'>⌕</InputGroupAddon>
           </InputGroup>
@@ -921,19 +968,20 @@ function LogsPanel() {
         </div>
       </div>
 
-      <div className='panel-foot'>
-        <span>日志保存在 <code id='logs-file'>{data.file}</code>，保留最近 500 条，重启后仍可查询。</span>
-        <span>429 自动切换会带上「原账号 → 目标账号」</span>
-        <div className='spacer' />
-        {/* 分页：页脚右侧，与面板头部的操作按钮同侧。边界判断与「第 N / M 页」读数都在 Pager 里
-            （与请求日志页同一个件）。flex-none 补的是旧 CSS `.log-pager { flex: 0 0 auto }` —— 组
-            件根是默认可收缩的 flex 项，不补的话窄窗口下整组会被压扁而不是像原来那样整组换行；
-            whitespace-nowrap 是继承属性，补的是 `.log-pager-info { white-space: nowrap }`，读数
-            不会在窄窗口里断成两行。翻页仍然只重绘不打接口（数据一次拉满，见 gotoPage）；原先
-            两颗按钮也没有「在途禁用」，这里不新加（Pager 的 disabled 缺省 false）。 */}
-        <Pager page={page} pageCount={pageCount} onPageChange={gotoPage}
-          className='flex-none whitespace-nowrap' />
-      </div>
+      {/* 读数 / 每页条数 / 跳页 / 翻页器交给通用表格外壳（table-shell.tsx）：五张表一套。
+          翻页只重绘不打接口（数据一次拉满，见 gotoPage），换档位同理 —— 所以这里能给出
+          「全部」那一档。页脚左侧原先还有两句说明（日志文件路径 / 429 切换文案），
+          按用户要求移除；`#logs-file` 那个元素随之消失，全仓无其它引用。 */}
+      <TableFooter
+        total={entries.length}
+        range={paged ? { start: pageRangeStart, end: pageRangeEnd } : null}
+        page={currentPage}
+        pageCount={pageCount}
+        size={size}
+        sizes={PAGE_SIZES}
+        onSizeChange={onSizeChange}
+        onPageChange={gotoPage}
+      />
     </section>
   )
 }

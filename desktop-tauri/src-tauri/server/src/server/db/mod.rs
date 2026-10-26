@@ -78,6 +78,7 @@
 //! 权限不足 / 库文件损坏都不该让整个桌面应用闪退。网关降级启动至少还能给出
 //! 可读的错误页面与日志。各 store 的接线点要按「数据库可能不存在」写。
 
+pub mod backup;
 pub mod migrate;
 pub mod schema;
 
@@ -219,6 +220,24 @@ impl Db {
     }
 }
 
+/// 只读地取某个库文件的 `PRAGMA user_version`（读不到返回 `None`）。
+///
+/// ── 为什么需要一条「独立于 `Db`」的读法 ──────────────────────
+/// 唯一调用点是 `ServerState::bootstrap` 里 `Db::open` **失败之后**那一步：那时
+/// 没有可用的 `Db` 句柄（正因为 schema 版本不符才失败），但仍需要知道「库里写的
+/// 版本号是多少」才能判断该不该让启动明确失败（库版本**高于**本程序 = 用户回退到
+/// 旧版本，见 `schema::migrate` 的拒绝分支与 `SCHEMA_VERSION` 的 v14 段）。
+/// 这里开一条**短命连接**只做「打开 → 读一个 PRAGMA → 关掉」。
+///
+/// 任何失败（文件不在、权限、库损坏、PRAGMA 读不出）一律返回 `None`：
+/// **读不到版本号 ≠ 版本不符**，据此拒绝启动会把「库彻底坏了」这种本该降级继续
+/// 的情形也变成启动失败。调用方只在拿到确切的 `Some(版本)` 且大于本程序时才拒绝。
+pub fn stored_schema_version(path: &Path) -> Option<i64> {
+    let conn = Connection::open(path).ok()?;
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .ok()
+}
+
 /// 打开连接后必须设置的 PRAGMA。
 ///
 /// 用 `execute_batch` 一次跑完而不是逐条 `pragma_update`：`journal_mode` 这个
@@ -253,4 +272,55 @@ fn apply_pragmas(conn: &Connection) -> Result<(), String> {
          PRAGMA busy_timeout=5000;",
     )
     .map_err(|error| format!("设置数据库 PRAGMA 失败: {error}"))
+}
+
+/// 测试专用：会**自己删文件**的临时库。
+///
+/// 为什么不是"打开前 `remove_file`"就完事：那只保证"不复用旧数据",不保证
+/// "不留垃圾"。文件名带进程 id,每轮 `cargo test` 都是一批新 pid —— Trae 一家
+/// 就这么在 `$TMPDIR` 里留下过 401 个文件、一百多 MB。所以清理必须挂在
+/// 拥有者的 `Drop` 上,调用点要把守卫**留在作用域里**(`let (store, _db) = …`),
+/// 而不是只拿那个 `Db`。
+///
+/// 测试中途 panic 也会走 drop(测试跑的是 unwind profile,`panic=abort`
+/// 只作用于生产构建),所以不需要显式 cleanup 调用。
+#[cfg(test)]
+pub(crate) mod test_temp {
+    use std::path::{Path, PathBuf};
+
+    use super::Db;
+
+    pub struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        /// 建一个带标签的临时库。第二个返回值是删文件的守卫,**必须由调用方
+        /// 持有到用例结束**(丢掉就等于回到"留一堆垃圾"的老行为)。
+        pub fn open(label: &str) -> (Db, TempDb) {
+            let safe: String = label
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+                .collect();
+            let path = std::env::temp_dir().join(format!("agent2api-test-{safe}-{}.db", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let db = Db::open(&path)
+                .unwrap_or_else(|error| panic!("临时库打不开（{}）：{error}", path.display()));
+            (db, TempDb { path })
+        }
+
+        #[allow(dead_code)]
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            // WAL / SHM 也要清:只删主文件会把它们留在原地。
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{}", self.path.display(), suffix));
+            }
+        }
+    }
 }

@@ -1,8 +1,8 @@
 /* ─────────────────────────────────────────────
    请求日志页：转发明细表（列形态参考 OmniProxy 的请求日志）
-   列表容器与筛选行（.log-list / .log-empty / .log-filters / .log-pager）
-   沿用 page-logs.css 的同一套声明，本文件只写表格本身、两个维度筛选的
-   宽度上限与窄窗口重排。
+   列表容器与筛选行（.log-list / .log-empty / .log-filters）沿用 page-logs.css
+   的同一套声明，本文件只写表格本身、两个维度筛选的宽度上限与窄窗口重排。
+   页脚分页栏是通用件（islands/table-shell.tsx），样式在 layout.css。
    颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
    ───────────────────────────────────────────── */
 
@@ -19,13 +19,14 @@
 .log-filters #req-provider { max-width: 168px; }
 .log-filters #req-model { max-width: 200px; }
 
-/* 九列：时间 / 提供商·账号 / 重试 / 状态 / 模型 / 用时 / 用量 / 错误 / 详情。
+/* 十列：时间 / 提供商·账号 / 重试 / 状态 / 模型 / 客户端 / 用时 / 用量 / 错误 / 详情。
    时间与用时定宽（等宽数字 + tabular-nums，竖着比对才齐），
    其余占弹性宽度（都是不定长内容，给固定宽度会互相挤）：
    模型 1.3fr（claude-sonnet-4-5 这类名字要放得下），
    用量 1.6fr（两行读数里 in/out/all 最长），超出由省略号收住、完整值进 title。
    状态 96px：进行中的行有两行（阶段徽章 + 阶段计时），而徽章最长是
    「等待响应」四个字（约 76px）—— 68px 那一版会把它压成省略号。
+   客户端 110px：最长的一档是「GitHub Copilot」（约 90px），再留一点余量。
    详情列定宽（只有一个「详情」按钮或一个「-」）。
 
    --req-cols 是用户拖过的列宽（table-columns.js 写在 #req-list 上，靠继承
@@ -38,7 +39,7 @@
 .req-head {
   display: grid;
   grid-template-columns: var(--req-cols,
-    92px minmax(0, 1.1fr) 52px 96px minmax(0, 1.3fr) 96px minmax(0, 1.6fr) minmax(0, 1.2fr) 60px);
+    92px minmax(0, 1.1fr) 52px 96px minmax(0, 1.3fr) 110px 96px minmax(0, 1.6fr) minmax(0, 1.2fr) 60px);
   gap: 12px;
   align-items: center;
   padding: 10px 14px;
@@ -262,7 +263,8 @@
 }
 
 /* 提供商 / 账号：同格两行，提供商在上（主读数）、账号在下（次）。
-   两者都是短名词，省略号收住长名字，完整值在各自的 title 里。 */
+   两者都是短名词，省略号收住长名字（账号名可能是「ZCode 国际版 · 一长串 uuid」），
+   完整值在各自的 title 里。 */
 .req-row .req-target {
   display: flex;
   flex-direction: column;
@@ -272,7 +274,14 @@
 
 .req-row .req-provider,
 .req-row .req-acct {
+  /* 必须限住宽度：列设置会给格子带上 ta-left，而 table-col-settings.css 的
+     `.req-row > .req-target.ta-left { align-items: flex-start }` 一并取消了
+     flex 子项默认的拉伸 —— 这两行的宽度随即变成「按内容算」（nowrap 一行两百
+     多像素），顶出格子压到右边列上，列再窄也不会出现省略号。
+     这里跟 .req-usage-line / .req-model-line / .req-dur-line 用同一个写法
+     （max-width: 100%）；单写 min-width: 0 实测压不住。 */
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -296,6 +305,20 @@
   white-space: nowrap;
 }
 
+/* 客户端：产品名（Codex / Claude Code …），普通文本 + 尾部省略。
+   与提供商 / 账号同档字号，不用等宽（它不是标识符）。 */
+.req-row .req-client {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 无客户端记录（旧行 / 模型测试 / 请求未带 UA）：破折号，与 target 列的占位同一手法 */
+.req-row .req-client.is-empty { color: var(--text-3); }
+
 /* 上下名分行的形态（转发名 ≠ 请求名时，如映射 / 备援改写）：
    ⬆️ 上游实际收到的名字（主读数）在上，⬇️ 下游请求的名字（淡一档）在下 ——
    与用时列的两行结构同一手法；单行请求不受影响（类不出现）。 */
@@ -317,8 +340,8 @@
 }
 
 /* 用时：等宽 + 右对齐，相邻行的数字能直接竖着比大小。
-   两行：总用时（主读数）+ 首响（次读数，淡一档，与用量列的 sub 同一手法）——
-   OmniProxy 的用时列就是这个形态。只有数据行是两行，表头仍是单行文本
+   两行：总用时（主读数）+ 首响（次读数，淡一档，与用量列的 sub 同一手法）。
+   只有数据行是多行，表头仍是单行文本
    （所有排版声明都带 .req-row 前缀限定在数据行上，见上方 .req-time 的说明）。 */
 .req-row .req-dur {
   display: flex;
@@ -345,8 +368,8 @@
   font-size: 11px;
 }
 
-/* 用量两行：in / out / all 与 缓存读取 / 命中率。
-   等宽 + tabular-nums，超出省略（完整两行读数在 title 里）。 */
+/* 用量两行：in / out / all 与 缓存读取 / 命中率（生成速度 tok/s 跟在命中率后，同一行）。
+   等宽 + tabular-nums，超出省略（完整读数在 title 里）。 */
 .req-row .req-usage {
   display: flex;
   flex-direction: column;
@@ -397,6 +420,7 @@
   .req-head .req-status { grid-row: 1; grid-column: 3 / 4; }
   .req-head .req-retry { grid-row: 1; grid-column: 4 / 5; }
   .req-head .req-target,
+  .req-head .req-client,
   .req-head .req-dur,
   .req-head .req-usage,
   .req-head .req-error-cell { display: none; }
@@ -410,7 +434,11 @@
   .req-row .req-target { grid-row: 2; grid-column: 1 / 3; }
   .req-row .req-dur { grid-row: 2; grid-column: 3 / 5; }
   /* 第三行：用量整行铺开（两行读数不再被列宽挤省略） */
-  .req-row .req-usage { grid-row: 3; grid-column: 1 / -1; }  .req-row .req-detail { grid-row: 4; grid-column: 4 / 5; justify-self: end; }
+  .req-row .req-usage { grid-row: 3; grid-column: 1 / -1; }
+  /* 第四行：客户端（左，跨到详情按钮之前）+ 详情（贴右）。
+     客户端不挤进第二行 —— 那一行右侧已经给了用时，96px 装不下「GitHub Copilot」 */
+  .req-row .req-client { grid-row: 4; grid-column: 1 / 4; }
+  .req-row .req-detail { grid-row: 4; grid-column: 4 / 5; justify-self: end; }
   /* 「-」占位不再独占一行：窄窗口下空行比省略号更难解释 */
   .req-row .req-error-cell { display: none; }
   /* 详情列头在窄窗口下没有稳定的列位（位置随有没有错误而变），一并隐藏 */
@@ -498,8 +526,16 @@
 /* 标签自身：沿用 .badge / .tag 的既有形制（尺寸与状态列那两枚一致），
    只补一个「可以悬停看详情」的指针语义与交互反馈 ——
    它是一颗真按钮（见 requests-panel.js 的 retryCell），所以要清掉按钮的
-   默认底色与内边距，让它看起来仍是徽章而不是一颗小按钮。 */
+   默认底色与内边距，让它看起来仍是徽章而不是一颗小按钮。
+
+   `height: auto` 不是可有可无的一行：components.css 里那条无分层的
+   `button { height: 30px }` 会**漏进组件库的徽章**——组件库的 tag 档只声明
+   `min-h-[19px]`（最小值压不住一个写死的 height），于是这两枚标签一直是 30px，
+   比状态列的「200」、模型表的「来源」都高一截，同列再放一枚 19px 的标签（如
+   「测试」）就变成两种高度并排。类选择器（0,1,0）胜过 `button`（0,0,1），
+   清掉高度把裁定权交回 min-height，三处标签才是同一个尺寸。 */
 .req-hover-tag {
+  height: auto;
   padding: 0 6px;
   border: 0;
   cursor: help;

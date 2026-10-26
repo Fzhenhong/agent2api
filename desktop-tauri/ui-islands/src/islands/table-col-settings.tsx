@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { Button, Popover, PopoverContent, SegmentedControl, Switch, cn } from '@ui'
+import { t } from '../i18n'
 
 /**
  * Agent2API · 表格列设置（列的显示 / 隐藏 · 顺序 · 对齐）—— React 岛。
@@ -9,11 +10,11 @@ import { Button, Popover, PopoverContent, SegmentedControl, Switch, cn } from '@
  *
  * ── 第一层：列配置的能力层（照旧保留）──────────────────────────
  * `register` / `apply` / `configOf` / `syncStaticHead` / `close` 五个方法是对外契约，
- * 四张表（账号表、模型管理、网关 Key、请求日志）在运行期调它们。它们读写的是一份
+ * 五张表（账号表、模型管理、网关 Key、请求日志、签到记录）在运行期调它们。它们读写的是一份
  * 「列 key → { 显示, 对齐 } 的有序配置」+ localStorage 持久化（键名前缀照旧），
- * 逻辑与口径逐字照抄 —— 这层不是「界面」，是四张表共用的**数据契约**：口径一动
+ * 逻辑与口径逐字照抄 —— 这层不是「界面」，是五张表共用的**数据契约**：口径一动
  * （`apply` 拿到的数组顺序、`configOf` 的返回形状、`syncStaticHead` 对静态表头做的事），
- * 四张表的列集合 / 顺序 / 对齐就会与面板各画一个样。所以这里只把它搬进 TS，不改行为。
+ * 五张表的列集合 / 顺序 / 对齐就会与面板各画一个样。所以这里只把它搬进 TS，不改行为。
  *
  * ── 第二层：浮层面板（本次换掉）────────────────────────────────
  * 外壳交给组件库的 `Popover`（Base UI，`modal={false}` 的非模态浮层）：定位（floating-ui）、
@@ -72,9 +73,9 @@ type Align = 'left' | 'center' | 'right'
  *（`{ value, label }` 就是它要的形状），所以档位只有这一处定义。
  */
 const ALIGNS: readonly { value: Align; label: string }[] = [
-  { value: 'left', label: '左' },
-  { value: 'center', label: '中' },
-  { value: 'right', label: '右' },
+  { value: 'left', label: t('左') },
+  { value: 'center', label: t('中') },
+  { value: 'right', label: t('右') },
 ]
 
 /** 存盘里的对齐只认这三档（脏值退回该列默认，见 normalize） */
@@ -109,14 +110,14 @@ type ColConfigItem = { key: string; visible: boolean; align: Align }
 type ColumnDecl = {
   key: string
   label?: string
-  /** 默认是否显示（不声明即显示）；四张表当前都没用到，作为契约的一部分保留 */
+  /** 默认是否显示（不声明即显示）；五张表当前都没用到，作为契约的一部分保留 */
   visible?: boolean
   align?: Align
   /** 上一版的默认对齐：只给 normalize 分辨旧存盘里那一档是「用户挑的」还是「旧默认值」 */
   legacyAlign?: Align
 }
 
-/** register 的入参（四张表各给一份；mount 是元素、选择器或返回元素的函数） */
+/** register 的入参（五张表各给一份；mount 是元素、选择器或返回元素的函数） */
 type TableSpec = {
   id: string
   label?: string
@@ -129,7 +130,7 @@ type TableSpec = {
   buttonClass?: string
 }
 
-/** 登记项 = 声明 + 当前配置（配置是运行期被面板改写的那一份，四张表也读它） */
+/** 登记项 = 声明 + 当前配置（配置是运行期被面板改写的那一份，五张表也读它） */
 type TableEntry = TableSpec & { config: ColConfigItem[] }
 
 /** 存盘形态 v2：`{ v, defaults, items }`；v1 是裸数组（见 normalize） */
@@ -411,7 +412,7 @@ type PanelProps = {
 /**
  * 列设置面板。
  *
- * 配置本体**不放在组件 state 里**：那是能力层的东西（`spec.config`），四张表的
+ * 配置本体**不放在组件 state 里**：那是能力层的东西（`spec.config`），五张表的
  * `apply()` 也读同一份。组件里存副本必然漂移，所以只用一个自增的版本号触发重画，
  * 渲染时直接读 `spec.config`。
  */
@@ -560,7 +561,7 @@ function ColSettingsPanel({ spec, anchor, repaintRef, onClose }: PanelProps) {
         sideOffset={6}
         collisionPadding={8}
         className='w-[336px]'
-        aria-label={`${spec.label || spec.id}的列设置`}
+        aria-label={t('{name}的列设置', { name: spec.label || spec.id })}
       >
         {/* 表头：与数据行同一套网格，四列依次是 手柄 / 列名 / 显示 / 对齐 */}
         <div
@@ -571,9 +572,9 @@ function ColSettingsPanel({ spec, anchor, repaintRef, onClose }: PanelProps) {
           )}
         >
           <span />
-          <span className='text-center'>列</span>
-          <span className='text-center'>显示</span>
-          <span className='text-center'>对齐</span>
+          <span className='text-center'>{t('列')}</span>
+          <span className='text-center'>{t('显示')}</span>
+          <span className='text-center'>{t('对齐')}</span>
         </div>
 
         {/* 行区滚动：列多时面板不跟着长，最大高度由外层（组件库）的 max-h 兜底 */}
@@ -595,7 +596,7 @@ function ColSettingsPanel({ spec, anchor, repaintRef, onClose }: PanelProps) {
               >
                 <span
                   className='flex cursor-grab items-center justify-center text-muted-foreground opacity-50 hover:opacity-100'
-                  title='按住拖动调整列顺序'
+                  title={t('按住拖动调整列顺序')}
                   onPointerDown={event => startDrag(item.key, event)}
                 >
                   {GRIP_ICON}
@@ -607,15 +608,15 @@ function ColSettingsPanel({ spec, anchor, repaintRef, onClose }: PanelProps) {
                   className='justify-self-center'
                   checked={item.visible}
                   onCheckedChange={next => setVisible(item.key, next)}
-                  aria-label={`显示「${label}」列`}
-                  title={item.visible ? '这一列正在显示' : '这一列已隐藏'}
+                  aria-label={t('显示「{label}」列', { label })}
+                  title={item.visible ? t('这一列正在显示') : t('这一列已隐藏')}
                 />
                 <SegmentedControl
                   className='w-full justify-center'
                   options={ALIGNS}
                   value={item.align}
                   onValueChange={next => setAlign(item.key, next)}
-                  aria-label={`「${label}」列的对齐`}
+                  aria-label={t('「{label}」列的对齐', { label })}
                 />
               </div>
             )
@@ -623,9 +624,9 @@ function ColSettingsPanel({ spec, anchor, repaintRef, onClose }: PanelProps) {
         </div>
 
         <div className='flex items-center gap-2 border-t border-hairline px-3 pt-2 pb-[9px]'>
-          <span className='flex-1 text-[11px] text-muted-foreground'>拖动 ⋮⋮ 调整顺序</span>
+          <span className='flex-1 text-[11px] text-muted-foreground'>{t('拖动 ⋮⋮ 调整顺序')}</span>
           <Button variant='outline' size='sm' onClick={resetAll}>
-            恢复默认
+            {t('恢复默认')}
           </Button>
         </div>
       </PopoverContent>
@@ -737,8 +738,8 @@ function makeButton(spec: TableEntry): Anchor {
   button.type = 'button'
   button.className = `sm colset-btn${spec.buttonClass ? ` ${spec.buttonClass}` : ''}`
   button.id = `btn-colset-${spec.id}`
-  button.title = `调整「${spec.label || spec.id}」的列：显示 / 隐藏、顺序、对齐`
-  button.innerHTML = `${shared().wbIcons?.icon?.('settings', 14) || ''}<span>列设置</span>`
+  button.title = t('调整「{name}」的列：显示 / 隐藏、顺序、对齐', { name: spec.label || spec.id })
+  button.innerHTML = `${shared().wbIcons?.icon?.('settings', 14) || ''}<span>${t('列设置')}</span>`
   button.setAttribute('aria-haspopup', 'dialog')
   button.setAttribute('aria-expanded', 'false')
   button.addEventListener('click', event => {

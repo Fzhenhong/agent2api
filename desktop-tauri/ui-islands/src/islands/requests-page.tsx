@@ -2,10 +2,19 @@ import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
 import {
-  Badge, BadgeDot, Button, Pager, SegmentedControl, Toggle,
+  Badge, BadgeDot, Button, SegmentedControl, Toggle,
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
   type SegmentedControlOption,
 } from '@ui'
+import {
+  DEFAULT_PAGE_SIZE,
+  SERVER_PAGE_SIZES,
+  TableFooter,
+  readPageSize,
+  writePageSize,
+  type PageSizeChoice,
+} from './table-shell'
+import { t } from '../i18n'
 
 /**
  * Agent2API · 请求日志页（网关转发明细：筛选 / 分页 / 自动刷新）—— React 岛。
@@ -16,7 +25,7 @@ import {
  *   window.wbRequestPhase  = { labelOf, badgeHtml, elapsedLineHtml, elapsedText, phaseOf }
  *
  * ── 数据口径（照旧，别改）──────────────────────────────────────
- * 明细按保留期存盘、条数无上限，所以走后端 offset/limit 真分页（每页 50 条 = 后端默认值，显式传
+ * 明细全量保留（不按天数 / 条数自动删除），条数没有上限，所以走后端 offset/limit 真分页（每页 50 条 = 后端默认值，显式传
  * 页数才算得出来）。后端支持时间区间 / 状态 / 模型 / 提供商四个维度，四者在存储层的**同一份
  * FilterPlan** 里编译成 SQL —— 所以「页面上筛出来的 N 条」与「清理弹窗删掉的那批」必然是同一个
  * 集合。前端这份口径只有一处实现（filterParams），列表 GET 与 clearParams 都从它取（见下）。
@@ -45,8 +54,9 @@ import {
  * 比 requests-panel.js 先加载」的那一帧等价），挂载后注册、再用 flushSync 按配置重画一次。
  *
  * ── 混合原则 ─────────────────────────────────────────────────
- * 布局类名照旧（.panel / .log-filters / .log-list / .log-pager …，页面 CSS 用它们分配高度与重排）；
- * 控件换成组件库：Button / Badge / Toggle / Pager / Select / SegmentedControl。列表里只有一处
+ * 布局类名照旧（.panel / .log-filters / .log-list …，页面 CSS 用它们分配高度与重排）；
+ * 控件换成组件库：Button / Badge / Toggle / Select / SegmentedControl；页脚分页栏是通用件
+ * （islands/table-shell.tsx，读数 / 每页条数 / 跳页 / 翻页器五张表一套）。列表里只有一处
  * 刻意**不**换：状态列的阶段徽章 —— HTML 由 wbRequestPhase 产出（详情弹窗读同一份，三处逐字
  * 一致是硬要求）。重试列那两枚标签则走 Badge 的 `render`：徽章的观感与「可聚焦、带
  * data-req-hover / data-req-id」两样都要，render 正是组件库为这件事补的出口。
@@ -63,7 +73,12 @@ type RequestEntry = {
   durationMs?: number; firstResponseMs?: number | null
   promptTokens?: number; completionTokens?: number; totalTokens?: number; cacheReadTokens?: number
   attempts?: number; attemptDetails?: unknown[]; sensitiveHits?: unknown[]
+  /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
+  isTest?: boolean
   phase?: string; phaseElapsedMs?: number | null; phaseStartedAt?: number | null
+  /** 来源客户端（后端 `client`：入口按下游 User-Agent 分类的结果；
+   *  空串 / 缺键 = 没有记录 —— 旧行、模型测试、请求未带 UA 的行） */
+  client?: string
 }
 
 type RequestQueryResult = {
@@ -127,6 +142,8 @@ type SharedWindow = {
   wbRequestClearModal?: { open?: () => unknown }
   wbColSettings?: ColSettingsApi
   wbTableColumns?: { repaint?: (id: string) => void }
+  /** Token 读数的量级口径（万 / 亿 与 k / M，随界面语言）：唯一实现在 ui/units.js */
+  wbUnits?: { formatTokens?: (value: unknown) => string }
 }
 
 function shared(): SharedWindow {
@@ -153,24 +170,25 @@ function escapeHtml(value: string): string {
  *
  * 数据来自后端在途期间写入的 `phase` / `phaseStartedAt`（见 core::upstream::usage::LogPhase）：
  * phase 空串 = 不在途（终态行、旧行），回落成通用的「进行中」。
+ * 文案（含悬停说明）在模块求值时走 t()：岛加载晚于 head 里的 i18n 词典注入，拿得到译文。
  */
 const PHASES: Record<string, { label: string; cls: string }> = {
-  connecting: { label: '连接中', cls: 'phase-connecting' },
-  waiting: { label: '等待响应', cls: 'phase-waiting' },
-  streaming: { label: '响应中', cls: 'phase-streaming' },
-  retrying: { label: '重试中', cls: 'phase-retrying' },
-  queued: { label: '排队中', cls: 'phase-queued' },
+  connecting: { label: t('连接中'), cls: 'phase-connecting' },
+  waiting: { label: t('等待响应'), cls: 'phase-waiting' },
+  streaming: { label: t('响应中'), cls: 'phase-streaming' },
+  retrying: { label: t('重试中'), cls: 'phase-retrying' },
+  queued: { label: t('排队中'), cls: 'phase-queued' },
 }
-const PHASE_FALLBACK_LABEL = '进行中'
+const PHASE_FALLBACK_LABEL = t('进行中')
 const PHASE_FALLBACK_CLS = 'running'
 /** 每个阶段的悬停说明：徽章只有四个字，落点要说清「这一步在干什么」 */
 const PHASE_TITLES: Record<string, string> = {
-  connecting: '请求已受理，正在选路、取凭证、建立上游连接',
-  waiting: '上游请求已发出，正在等第一个字节到达（模型的思考时间也在这段）',
-  streaming: '首帧已到，上游内容正在下发',
-  retrying: '本轮尝试失败，正在退避等待或切换到下一个账号',
-  queued: '上游模型繁忙，请求已排进上游队列；网关正按上游建议的时长等待后重发（不是登录态或额度问题）',
-  '': '请求正在转发中，用时列显示的是已用时',
+  connecting: t('请求已受理，正在选路、取凭证、建立上游连接'),
+  waiting: t('上游请求已发出，正在等第一个字节到达（模型的思考时间也在这段）'),
+  streaming: t('首帧已到，上游内容正在下发'),
+  retrying: t('本轮尝试失败，正在退避等待或切换到下一个账号'),
+  queued: t('上游模型繁忙，请求已排进上游队列；网关正按上游建议的时长等待后重发（不是登录态或额度问题）'),
+  '': t('请求正在转发中，用时列显示的是已用时'),
 }
 
 /** 行对象里那个阶段字面量，非法值一律按「没有阶段」处理（不猜） */
@@ -197,8 +215,8 @@ function phaseElapsedText(ms: unknown): string {
   const value = Number(ms)
   if (!Number.isFinite(value) || value < 0) return ''
   const seconds = Math.max(1, Math.floor(value / 1000))
-  if (seconds < 60) return `${seconds}秒`
-  return `${Math.floor(seconds / 60)}分${seconds % 60}秒`
+  if (seconds < 60) return t('{n}秒', { n: seconds })
+  return t('{m}分{s}秒', { m: Math.floor(seconds / 60), s: seconds % 60 })
 }
 
 /**
@@ -232,7 +250,8 @@ function phaseElapsedLineHtml(entry: unknown): string {
   const text = phaseElapsedText(phaseElapsedMsOf(entry))
   if (!text) return ''
   const label = phaseLabelOf(entry)
-  return `<span class="req-phase-elapsed" title="${escapeHtml(`进入「${label}」阶段已持续 ${text}`)}">`
+  const tip = t('进入「{phase}」阶段已持续 {time}', { phase: label, time: text })
+  return `<span class="req-phase-elapsed" title="${escapeHtml(tip)}">`
     + `${escapeHtml(text)}</span>`
 }
 
@@ -240,23 +259,34 @@ function phaseElapsedLineHtml(entry: unknown): string {
  * key 取 table-columns.js 里登记的同一套：与 CSS 里的 .req-xxx 类同名；`sel` 是表头格的
  * 选择器、`track` 是默认轨道。列的集合只有一套，这里管显隐与顺序，那边管列宽。 */
 const COLUMNS: Column[] = [
-  { key: 'time', label: '时间', sel: '.req-time', track: '92px' },
-  { key: 'target', label: '提供商 / 账号', sel: '.req-target', track: 'minmax(0, 1.1fr)' },
-  { key: 'retry', label: '重试', sel: '.req-retry', track: '52px' },
-  { key: 'status', label: '状态', sel: '.req-status', track: '96px' },
-  { key: 'model', label: '模型', sel: '.req-model', track: 'minmax(0, 1.3fr)' },
-  { key: 'dur', label: '用时', sel: '.req-dur', track: '96px', align: 'right' },
-  { key: 'usage', label: '用量', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
-  { key: 'error', label: '错误', sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
-  { key: 'detail', label: '详情', sel: '.req-detail', track: '60px', align: 'right' },
+  { key: 'time', label: t('时间'), sel: '.req-time', track: '92px' },
+  { key: 'target', label: t('提供商 / 账号'), sel: '.req-target', track: 'minmax(0, 1.1fr)' },
+  { key: 'retry', label: t('重试'), sel: '.req-retry', track: '52px' },
+  { key: 'status', label: t('状态'), sel: '.req-status', track: '96px' },
+  { key: 'model', label: t('模型'), sel: '.req-model', track: 'minmax(0, 1.3fr)' },
+  { key: 'client', label: t('客户端'), sel: '.req-client', track: '110px' },
+  { key: 'dur', label: t('用时'), sel: '.req-dur', track: '96px', align: 'right' },
+  { key: 'usage', label: t('用量'), sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
+  { key: 'error', label: t('错误'), sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
+  { key: 'detail', label: t('详情'), sel: '.req-detail', track: '60px', align: 'right' },
 ]
 
 /* ─── 常量 ─────────────────────────────────── */
 
 /** 自动刷新间隔兜底值 = 后端默认间隔（DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS）；实际值由「定时任务」页决定 */
 const DEFAULT_AUTO_REFRESH_MS = 1_000
-/** 每页条数：与后端 DEFAULT_LIMIT 一致（显式传，页数才算得出来） */
-const PAGE_SIZE = 50
+/** 每页条数的档位：与页脚的「每页」下拉同源（不给「全部」，理由见 queryParams） */
+const PAGE_SIZES = SERVER_PAGE_SIZES
+
+/**
+ * 本页的档位里没有「全部」，所以每页条数**恒为数字**；这个折算函数只是把
+ * 通用组件的 `PageSizeChoice` 收成 number，供算术使用（offset/pageCount 都要算）。
+ * 真拿到 'all'（存盘被改坏、或以后误加了档位）就回落默认值，不让它变成 NaN。
+ */
+function numericSize(choice: PageSizeChoice): number {
+  return typeof choice === 'number' && choice > 0 ? choice : DEFAULT_PAGE_SIZE
+}
+
 /** 时间档位的持久化键：沿用拆分前「模型请求」视图的键，用户已选的档位不因拆页丢失 */
 const RANGE_KEY = 'workbuddy-desktop-logs-requests-range'
 /** 三个下拉筛选的跨次启动记忆（空串 = 「全部」） */
@@ -269,10 +299,10 @@ const RANGES: readonly string[] = ['today', '7', '30', 'month', 'all']
 const DEFAULT_RANGE = 'all'
 /** 摘要文字（「近 7 天」）与分段控件上的短标签（「7 天」）是两套，别合并：控件里位置窄 */
 const RANGE_LABEL: Record<string, string> = {
-  today: '今天', 7: '近 7 天', 30: '近 30 天', month: '本月', all: '全部',
+  today: t('今天'), 7: t('近 7 天'), 30: t('近 30 天'), month: t('本月'), all: t('全部'),
 }
 const RANGE_OPTION_LABEL: Record<string, string> = {
-  today: '今天', 7: '7 天', 30: '30 天', month: '本月', all: '全部',
+  today: t('今天'), 7: t('7 天'), 30: t('30 天'), month: t('本月'), all: t('全部'),
 }
 /** 选项提到模块级：SegmentedControl 每拿到新数组都要重新量滑块位置，常量能省掉这轮测量 */
 const RANGE_OPTIONS: readonly SegmentedControlOption<string>[] = RANGES.map(value => ({
@@ -281,13 +311,13 @@ const RANGE_OPTIONS: readonly SegmentedControlOption<string>[] = RANGES.map(valu
 
 /** 状态下拉的选项（与旧 index.html 里那三个 option 逐字一致） */
 const STATUS_OPTIONS: readonly { value: string; label: string }[] = [
-  { value: '', label: '全部状态' },
-  { value: 'ok', label: '成功' },
-  { value: 'error', label: '失败' },
+  { value: '', label: t('全部状态') },
+  { value: 'ok', label: t('成功') },
+  { value: 'error', label: t('失败') },
 ]
-const ALL_STATUS_LABEL = '全部状态'
-const ALL_PROVIDER_LABEL = '全部提供商'
-const ALL_MODEL_LABEL = '全部模型'
+const ALL_STATUS_LABEL = t('全部状态')
+const ALL_PROVIDER_LABEL = t('全部提供商')
+const ALL_MODEL_LABEL = t('全部模型')
 
 type Filters = { status: string; provider: string; model: string }
 const DEFAULT_FILTERS: Filters = { status: '', provider: '', model: '' }
@@ -323,6 +353,8 @@ const current = {
   range: readRange(),
   runningOnly: false,
   offset: 0,
+  /** 每页条数：用户可在页脚换档（持久化在 table-shell 的 readPageSize 里，这里存当前值） */
+  size: numericSize(readPageSize('requests', SERVER_PAGE_SIZES)),
 }
 /** 三个筛选的落盘副本（启动时从 wbFilterMemory 读回；见 readSavedFilters） */
 let savedFilters: Filters = { ...DEFAULT_FILTERS }
@@ -436,7 +468,10 @@ function filterParams(): URLSearchParams {
 function queryParams(): string {
   const params = filterParams()
   params.set('offset', String(current.offset))
-  params.set('limit', String(PAGE_SIZE))
+  // 每页条数是**用户可换的档位**（页脚的「每页 N 条」）：后端只要求 limit > 0，
+  // 不给上限，档位由前端收在 SERVER_PAGE_SIZES 里（没有「全部」那一档 —— 明细条数
+  // 无上限，全渲染会把浏览器拖死，见 table-shell 的文件头）
+  params.set('limit', String(current.size))
   return params.toString()
 }
 
@@ -447,9 +482,43 @@ function formatDuration(ms: unknown): string {
   const rounded = Math.round(Number(ms) || 0)
   if (rounded < 1000) return `${rounded}ms`
   const seconds = Math.floor(rounded / 1000)
-  if (seconds >= 60) return `${Math.floor(seconds / 60)}分${seconds % 60}秒`
+  if (seconds >= 60) return t('{m}分{s}秒', { m: Math.floor(seconds / 60), s: seconds % 60 })
   const millis = rounded % 1000
-  return millis > 0 ? `${seconds}秒${millis}ms` : `${seconds}秒`
+  return millis > 0 ? t('{s}秒{ms}ms', { s: seconds, ms: millis }) : t('{n}秒', { n: seconds })
+}
+
+/**
+ * 生成速度（tok/s）的悬停说明：口径与回落规则都在这里说清 —— 显示出来的数可能
+ * 按流式段算、也可能按总用时算（回落），不说明白会让人拿它对不上别的工具。
+ */
+const SPEED_TIP = t('生成速度：输出 token ÷ 流式段用时（总用时 − 首响）；流式段不足总用时一半时按总用时计')
+
+/** 流式段的下界（毫秒）：低于它按总用时计，见 tokensPerSecond */
+const STREAM_MS_FLOOR = 500
+
+/**
+ * 生成速度（tok/s）：输出 token ÷ 流式段用时（总用时 − 首响）。
+ *
+ * 分母刻意**不含**「等首帧」的时间 —— 那段若是模型的静默思考（首帧前上游一字节
+ * 不发），算进去会把生成速度压得明显偏低。但反过来，流式段只是一条**短尾巴**时
+ * 也不能按它算：思考型上游常常整段思考都不发帧，token 在首帧后的一个小窗口里
+ * 一股脑到达（上游缓冲、聚合路径、隐藏思考都是这个形态），486 token ÷ 0.6 秒
+ * 窗口能算出 800+ tok/s 的假速度 —— 那测的是「下发得快」，不是「生成得快」。
+ * 所以护栏两条，不满足就回落按总用时计（宁可给保守的平均速度，不给天文数字）：
+ *   · 流式段 ≥ STREAM_MS_FLOOR（非流式响应 duration ≈ 首响，分母趋零）；
+ *   · 流式段 ≥ 总用时的一半（内容段要撑得起请求，短尾窗口的读数不可信）。
+ * 输出 / 总用时为 0（失败行 token 清零、旧行）→ 空串，调用方整行省掉。
+ * 进行中行没有 completionTokens（收尾才记账），自然走空串 —— 速度只有终态行才有。
+ */
+function tokensPerSecond(entry: RequestEntry): string {
+  const tokens = Number(entry.completionTokens) || 0
+  const duration = Number(entry.durationMs) || 0
+  if (tokens <= 0 || duration <= 0) return ''
+  const first = Number(entry.firstResponseMs)
+  const streamMs = Number.isFinite(first) && first > 0 && first < duration ? duration - first : 0
+  const streaming = streamMs >= STREAM_MS_FLOOR && streamMs * 2 >= duration
+  const rate = tokens / ((streaming ? streamMs : duration) / 1000)
+  return `${rate >= 100 ? Math.round(rate) : rate.toFixed(1)} tok/s`
 }
 
 /**
@@ -462,9 +531,10 @@ function formatFirstResponse(ms: unknown): string {
   return formatDuration(value)
 }
 
-/** 用量读数：明细里存的是精确值，展示也用精确值（千分位），缩写会丢比对基准 */
+/** 用量读数：量级词与分档交给 units.js 的 formatTokens（与报表页 / 账号页同一口径，
+ *  中文「万 / 亿」与英文「k / M」的切换在那边一处）；桥不在位时退回精确千分位 */
 function formatTokens(value: unknown): string {
-  return (Number(value) || 0).toLocaleString('zh-CN')
+  return shared().wbUnits?.formatTokens?.(value) ?? (Number(value) || 0).toLocaleString('zh-CN')
 }
 
 /**
@@ -473,7 +543,7 @@ function formatTokens(value: unknown): string {
  */
 function formatElapsed(ts: unknown): string {
   const elapsed = Math.max(0, Date.now() - (Number(ts) || 0))
-  return `${Math.max(1, Math.floor(elapsed / 1000))}秒`
+  return t('{n}秒', { n: Math.max(1, Math.floor(elapsed / 1000)) })
 }
 
 /** 缓存命中率：命中读取 / 输入，分母为 0 时无意义，给「-」 */
@@ -517,9 +587,9 @@ function countRetries(entry: RequestEntry): number {
   }, 0)
 }
 
-/** 提供商展示名：providers.js 目录 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
+/** 提供商展示名：providers.js 目录（注册名）→ 查词典 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
 function providerLabelOf(id: string): string {
-  return shared().wbProviders?.labelOf?.(id) || id
+  return t(shared().wbProviders?.labelOf?.(id) || id)
 }
 
 /** 行 key 的去重：ts 在同一毫秒可能重复（并发请求），重复的补一个序号后缀，避免 React 报重复 key */
@@ -551,7 +621,7 @@ async function refreshFilterOptions(): Promise<void> {
   try {
     const filters = await shared().workbuddyDesktop?.getStatsRequestFilters()
     const providers: ProviderOption[] = (Array.isArray(filters?.providers) ? filters.providers : [])
-      .map(item => ({ value: String(item?.id || ''), label: String(item?.label || item?.id || '') }))
+      .map(item => ({ value: String(item?.id || ''), label: t(String(item?.label || item?.id || '')) }))
       .filter(item => item.value)
     const models: string[] = (Array.isArray(filters?.models) ? filters.models : [])
       .map(name => String(name || ''))
@@ -617,7 +687,7 @@ function ensureColumns(): void {
   colTried = true
   colHandle = api.register({
     id: 'requests',
-    label: '请求日志表',
+    label: t('请求日志表'),
     columns: COLUMNS.map(({ key, label, align }) => ({ key, label, align })),
     mount: () => document.querySelector('.page[data-page="requests"] .panel-head .head-actions'),
     onChange: () => {
@@ -652,9 +722,9 @@ const EMPTY_DATA: PanelData = {
 }
 
 function emptyText(data: PanelData): string {
-  if (!data.loaded) return '正在加载请求日志…'
-  if (!data.total) return '暂无请求日志，网关还没有转发过请求'
-  return '没有符合筛选条件的请求'
+  if (!data.loaded) return t('正在加载请求日志…')
+  if (!data.total) return t('暂无请求日志，网关还没有转发过请求')
+  return t('没有符合筛选条件的请求')
 }
 
 /* ─── 单元格渲染 ───────────────────────────── */
@@ -667,8 +737,8 @@ function runningFirstLine(entry: RequestEntry): React.ReactNode {
   const value = Number(entry.firstResponseMs)
   if (!Number.isFinite(value) || value <= 0) return null
   return (
-    <span className='req-dur-line sub' title='首响：上游首帧到达的耗时（请求仍在转发中）'>
-      {`首响 ${formatDuration(value)}`}
+    <span className='req-dur-line sub' title={t('首响：上游首帧到达的耗时（请求仍在转发中）')}>
+      {t('首响 {time}', { time: formatDuration(value) })}
     </span>
   )
 }
@@ -702,21 +772,25 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
     case 'target': {
       const id = String(entry.provider ?? '').trim()
       const fromBackend = String(entry.providerLabel ?? '').trim()
-      const provider = fromBackend || (id ? providerLabelOf(id) : '')
+      // 后端给的是注册名（「WorkBuddy 国内版」这类），与目录侧一样要过一遍词典
+      const provider = fromBackend ? t(fromBackend) : (id ? providerLabelOf(id) : '')
       // 账号为空 = 请求在选定账号之前就失败了（后端契约：无账号时给空串），显式给破折号而不是留空
       return (
         <span key={key} className={className}>
           {provider ? (
-            <span className='req-provider' title={id && id !== provider ? `${provider}（${id}）` : provider}>
+            <span className='req-provider'
+              title={id && id !== provider ? t('{name}（{id}）', { name: provider, id }) : provider}>
               {provider}
             </span>
           ) : (
-            <span className='req-provider is-empty' title='这条明细没有记录提供商（旧数据或请求未走到转发）'>—</span>
+            <span className='req-provider is-empty'
+              title={t('这条明细没有记录提供商（旧数据或请求未走到转发）')}>—</span>
           )}
           {entry.accountName ? (
             <span className='req-acct' title={entry.accountId || entry.accountName}>{entry.accountName}</span>
           ) : (
-            <span className='req-acct is-empty' title='请求在任何账号接手之前就失败了'>—</span>
+            <span className='req-acct is-empty'
+              title={t('请求在任何账号接手之前就失败了')}>—</span>
           )}
         </span>
       )
@@ -726,6 +800,16 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       const attempts = Number(entry.attempts) || 1
       const identity = rowKey(entry)
       const tags: React.ReactNode[] = []
+      // 「测试」标记：这一行是模型管理页操作列那颗「测试」发起的（后端 `is_test`）。它与另外两枚
+      // 标签不同 —— **不是**悬停面板的锚点，只是一枚事实标签（brand 档，与模型表的「远程」同义），
+      // 所以不用 render 成 button。它进标签列而不是另开一列：它回答的正是「这一行是什么性质」，
+      // 与「重试 / 敏」同一类读数，而这张表的列是列设置里可拖的固定集合，为一个布尔值加一列不划算
+      if (entry.isTest) {
+        tags.push(
+          <Badge key='test' variant='brand' shape='tag'
+            title={t('这条明细是一次模型测试（人工发起）：走的是真实转发链路，但不计入报表统计')}>{t('测试')}</Badge>,
+        )
+      }
       // 判据交给悬停面板模块（它要读明细内部字段）；兜底成 attempts > 1：模块没就绪时至少换过
       // 号的请求仍能显示标签，而不是整列静默变空
       const showChain = shared().wbRequestHover?.hasProcessFacts?.(entry) ?? attempts > 1
@@ -737,7 +821,7 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
           // button 上（不是覆盖），观感则回到组件库的语义档（原来手写的 `warn` 即 warning）
           <Badge key='chain' variant='warning' shape='tag' render={<button type='button' />}
             className='req-hover-tag' data-req-hover='chain' data-req-id={identity}>
-            {count > 1 ? `重试 ${count}` : '重试'}
+            {count > 1 ? t('重试 {n}', { n: count }) : t('重试')}
           </Badge>,
         )
       }
@@ -749,7 +833,7 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
         tags.push(
           <Badge key='sensitive' variant='sensitive' shape='tag' render={<button type='button' />}
             className='req-hover-tag' data-req-hover='sensitive' data-req-id={identity}
-            aria-label='命中了敏感词'>敏</Badge>,
+            aria-label={t('命中了敏感词')}>{t('敏')}</Badge>,
         )
       }
       if (!tags.length) return <span key={key} className={`req-none ta-${align}`}>-</span>
@@ -764,8 +848,8 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
           return (
             <span key={key} className={className}>
               <span className='req-status-badge'>
-                <Badge shape='tag' variant='info' title='请求正在转发中，用时列显示的是已用时'>
-                  <BadgeDot className='req-live-dot' aria-hidden='true' />进行中
+                <Badge shape='tag' variant='info' title={t('请求正在转发中，用时列显示的是已用时')}>
+                  <BadgeDot className='req-live-dot' aria-hidden='true' />{t('进行中')}
                 </Badge>
               </span>
             </span>
@@ -784,12 +868,12 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       const ok = isOk(entry)
       // 走到这里 status=0 的只剩「还没发出请求就失败」的历史行：写 0 会被读成 HTTP 状态码，退成「失败」
       const title = !ok && status >= 200 && status < 300
-        ? `HTTP ${status}，但响应体阶段出错：见错误列`
+        ? t('HTTP {status}，但响应体阶段出错：见错误列', { status })
         : undefined
       return (
         <span key={key} className={className}>
           <Badge shape='tag' variant={ok ? 'success' : 'destructive'} title={title}>
-            {status || '失败'}
+            {status || t('失败')}
           </Badge>
         </span>
       )
@@ -811,8 +895,32 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       const downText = tag(client, clientLevel)
       return (
         <span key={key} className={`${className} req-model-split`}>
-          <span className='req-model-line' title={`转发到上游的模型：${upText}`}>⬆️ {upText}</span>
-          <span className='req-model-line sub' title={`下游请求的模型：${downText}`}>⬇️ {downText}</span>
+          <span className='req-model-line'
+            title={t('转发到上游的模型：{model}', { model: upText })}>⬆️ {upText}</span>
+          <span className='req-model-line sub'
+            title={t('下游请求的模型：{model}', { model: downText })}>⬇️ {downText}</span>
+        </span>
+      )
+    }
+
+    case 'client': {
+      // 后端存的是**归类结果**（Codex / ZCode / Claude Code / …，见 core::client），
+      // 空串 = 没有记录（旧行、模型测试、请求未带 UA）。产品名是标识符不翻译，
+      // 只有兜底类 `other` 翻成「其它」；空值给占位符而不是空格子。
+      const value = String(entry.client ?? '').trim()
+      if (!value) {
+        return (
+          <span key={key} className={`${className} is-empty`}
+            title={t('这条明细没有记录来源客户端（旧数据、模型测试，或请求未带 User-Agent）')}>—</span>
+        )
+      }
+      const label = value === 'other' ? t('其它') : value
+      return (
+        <span key={key} className={className}
+          title={value === 'other'
+            ? t('识别到 User-Agent，但不属于已知的客户端类型：{ua}', { ua: value })
+            : t('来源客户端：{client}', { client: label })}>
+          {label}
         </span>
       )
     }
@@ -822,7 +930,7 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
         // 进行中行没有 durationMs（收尾才记账）：主行显示已用时（每拍轮询在走）
         return (
           <span key={key} className={className}>
-            <span className='req-dur-line' title='已用时（请求仍在转发中）'>{formatElapsed(entry.ts)}</span>
+            <span className='req-dur-line' title={t('已用时（请求仍在转发中）')}>{formatElapsed(entry.ts)}</span>
             {runningFirstLine(entry)}
           </span>
         )
@@ -830,8 +938,8 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       return (
         <span key={key} className={className}>
           <span className='req-dur-line'>{formatDuration(entry.durationMs)}</span>
-          <span className='req-dur-line sub' title='首响：上游首帧到达的耗时'>
-            {`首响 ${formatFirstResponse(entry.firstResponseMs)}`}
+          <span className='req-dur-line sub' title={t('首响：上游首帧到达的耗时')}>
+            {t('首响 {time}', { time: formatFirstResponse(entry.firstResponseMs) })}
           </span>
         </span>
       )
@@ -843,18 +951,28 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       // 失败请求的 token 由后端一律清零，写「0」会让人以为真的消耗了这些量
       if (!isOk(entry)) {
         return (
-          <span key={key} className={className} title='失败请求不记录用量'>
+          <span key={key} className={className} title={t('失败请求不记录用量')}>
             <span className='req-usage-line'>in: - / out: - / all: -</span>
-            <span className='req-usage-line sub'>缓存读取: - / 命中率: -</span>
+            <span className='req-usage-line sub'>{t('缓存读取: - / 命中率: -')}</span>
           </span>
         )
       }
       const line1 = `in: ${formatTokens(entry.promptTokens)} / out: ${formatTokens(entry.completionTokens)} / all: ${formatTokens(entry.totalTokens)}`
-      const line2 = `缓存读取: ${formatTokens(entry.cacheReadTokens)} / 命中率: ${cacheRate(entry)}`
+      const line2 = t('缓存读取: {cache} / 命中率: {rate}', {
+        cache: formatTokens(entry.cacheReadTokens), rate: cacheRate(entry),
+      })
+      // 生成速度跟在命中率后面（**同一行**，不另起一行）：速度是「token ÷ 时间」的
+      // 导出量，归在用量读数一族；只有成功行有 token（失败行清零），拿不到就不加。
+      // 整行 nowrap，超宽省略 —— 完整读数在 title 里（与该列既有手法同一套）
+      const speed = tokensPerSecond(entry)
+      const line2full = speed ? `${line2} · ${speed}` : line2
       return (
-        <span key={key} className={className} title={`${line1}\n${line2}`}>
+        <span key={key} className={className} title={[line1, line2full].filter(Boolean).join('\n')}>
           <span className='req-usage-line'>{line1}</span>
-          <span className='req-usage-line sub'>{line2}</span>
+          <span className='req-usage-line sub'>
+            {line2}
+            {speed ? <span title={SPEED_TIP}> · {speed}</span> : null}
+          </span>
         </span>
       )
     }
@@ -874,8 +992,8 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       if (!id) return <span key={key} className={`req-none ${base} ta-${align}`}>-</span>
       return (
         <span key={key} className={className}>
-          <Button size='sm' variant='outline' className='req-detail-btn' title='查看该请求的上游原始报文'
-            onClick={() => { void shared().wbRequestDetail?.open?.(id, entry) }}>详情</Button>
+          <Button size='sm' variant='outline' className='req-detail-btn' title={t('查看该请求的上游原始报文')}
+            onClick={() => { void shared().wbRequestDetail?.open?.(id, entry) }}>{t('详情')}</Button>
         </span>
       )
     }
@@ -907,6 +1025,8 @@ function RequestsPage() {
   const [range, setRange] = React.useState<string>(() => current.range)
   const [runningOnly, setRunningOnly] = React.useState(false)
   const [offset, setOffset] = React.useState(0)
+  /** 每页条数（页脚可换）：模块级 current.size 是权威，这里只是渲染镜像 */
+  const [pageSize, setPageSize] = React.useState<number>(() => current.size)
   const [auto, setAuto] = React.useState(() => ({ ms: autoRefreshMs, enabled: autoEnabled }))
   const [providerOptions, setProviderOptions] = React.useState<ProviderOption[]>([])
   const [modelOptions, setModelOptions] = React.useState<string[]>([])
@@ -984,7 +1104,7 @@ function RequestsPage() {
     const token = ++seq
     try {
       const api = shared().workbuddyDesktop
-      if (!api) throw new Error('后端桥不可用')
+      if (!api) throw new Error(t('后端桥不可用'))
       const result = await api.getStatsRequests(queryParams())
       if (token !== seq) return
       const next: PanelData = {
@@ -995,8 +1115,8 @@ function RequestsPage() {
         loaded: true,
         error: '',
       }
-      // 明细被清空或被保留期裁掉后，停在第 5 页会看到一片空白：先把 offset 夹回最后一页
-      const lastOffset = Math.max(0, (Math.ceil(next.matched / PAGE_SIZE) - 1) * PAGE_SIZE)
+      // 明细被清空后，停在第 5 页会看到一片空白：先把 offset 夹回最后一页
+      const lastOffset = Math.max(0, (Math.ceil(next.matched / current.size) - 1) * current.size)
       if (current.offset > lastOffset) {
         applyOffset(lastOffset)
         return loadPanel({ silent })
@@ -1009,7 +1129,7 @@ function RequestsPage() {
       // 静默（轮询）时保留上一屏数据，只当没刷过：把读数清成 0 会让人以为明细被删了
       if (!silent) {
         console.warn('读取请求日志失败:', errorMessage(error))
-        paintError('读取请求日志失败，详见控制台')
+        paintError(t('读取请求日志失败，详见控制台'))
       }
     }
   }, [applyOffset, paint, paintError, restoreSavedFilters])
@@ -1107,12 +1227,30 @@ function RequestsPage() {
 
   /** 翻页要真打接口（offset 是后端口径），到边界直接不发请求 */
   function gotoPage(target: number): void {
-    const pageCount = Math.max(1, Math.ceil(data.matched / PAGE_SIZE))
+    const pageCount = Math.max(1, Math.ceil(data.matched / current.size))
     const next = Math.min(Math.max(1, target), pageCount)
-    const nextOffset = (next - 1) * PAGE_SIZE
+    const nextOffset = (next - 1) * current.size
     if (nextOffset === current.offset) return
     applyOffset(nextOffset)
     pendingScrollRef.current = 0   // 新一页从顶部开始读
+    void loadPanel()
+  }
+
+  /**
+   * 换每页条数：先落盘再按**当前第一条**换算页码，避免「换档之后看到别的数据」——
+   * 比如停在第 3 页（每页 50，即第 101 条）改成每页 100，应该落在第 2 页的第 101 条
+   * 上，而不是回到第一页。换算后的 offset 一般不是新档位的整数倍，页脚读数按
+   * 「当前第 a–b 条」显示，页码由 offset 反推（与旧实现同一口径）。
+   */
+  function onPageSizeChange(choice: PageSizeChoice): void {
+    const next = numericSize(choice)
+    if (next === current.size) return
+    current.size = next
+    setPageSize(next)
+    writePageSize('requests', next)
+    const first = current.offset + 1
+    applyOffset(Math.max(0, Math.floor((first - 1) / next) * next))
+    pendingScrollRef.current = 0
     void loadPanel()
   }
 
@@ -1148,19 +1286,25 @@ function RequestsPage() {
   /* ─── 渲染 ─────────────────────────────── */
 
   const columns = visibleColumns()
-  const pageCount = Math.max(1, Math.ceil(data.matched / PAGE_SIZE))
-  const currentPage = Math.min(pageCount, Math.floor(offset / PAGE_SIZE) + 1)
+  const pageCount = Math.max(1, Math.ceil(data.matched / current.size))
+  const currentPage = Math.min(pageCount, Math.floor(offset / current.size) + 1)
+  /** 本页显示的区间（1 起闭区间）：给页脚的「当前第 a–b 条」用。
+      名字带 page 前缀：`rangeStart` 已被上面的时间档位函数占用（模块级） */
+  const pageRangeStart = data.matched ? offset + 1 : 0
+  const pageRangeEnd = data.matched ? offset + data.entries.length : 0
   const badgeText = data.error
     ? '—'
-    : data.matched === data.total ? `${data.total} 条` : `${data.matched} / ${data.total} 条`
+    : data.matched === data.total
+      ? t('{n} 条', { n: data.total })
+      : t('{matched} / {total} 条', { matched: data.matched, total: data.total })
   // 「仅看进行中」开着时整页都是进行中，再缀一遍就成了复读
-  const liveText = !runningOnly && data.running > 0 ? ` · ${data.running} 进行中` : ''
+  const liveText = !runningOnly && data.running > 0 ? t(' · {n} 进行中', { n: data.running }) : ''
 
   /** 页脚读数：范围、状态、提供商与模型都写出来，「为什么只有这几条」一眼可查 */
-  const summaryParts = [RANGE_LABEL[range] || '全部']
-  if (runningOnly) summaryParts.push('只看进行中')
-  else if (filters.status === 'ok') summaryParts.push('只看成功')
-  else if (filters.status === 'error') summaryParts.push('只看失败')
+  const summaryParts = [RANGE_LABEL[range] || t('全部')]
+  if (runningOnly) summaryParts.push(t('只看进行中'))
+  else if (filters.status === 'ok') summaryParts.push(t('只看成功'))
+  else if (filters.status === 'error') summaryParts.push(t('只看失败'))
   if (filters.provider) summaryParts.push(providerLabelOf(filters.provider))
   if (filters.model) summaryParts.push(filters.model)
 
@@ -1185,16 +1329,16 @@ function RequestsPage() {
   return (
     <section className='panel'>
       <div className='panel-head'>
-        <h2>请求日志列表</h2>
+        <h2>{t('请求日志列表')}</h2>
         {/* id 保留：app.js 的 renderTopbarStatus 按 id 镜像这枚徽标的文案与配色（data-tone 空串
             = 无修饰，与旧实现 renderBadge 只写 'badge' 等价） */}
         <Badge id='req-badge' variant='outline' data-tone=''>{badgeText + liveText}</Badge>
-        <span className='panel-sub'>按时间倒序，保留期在设置页可调</span>
+        <span className='panel-sub'>{t('按时间倒序，全量保留')}</span>
         <div className='head-actions'>
           {/* 打开清理弹窗（request-clear-modal.tsx）：两种删除方式 + 预览统计 + 压缩数据库都在
               那边；本页只负责把当前筛选参数给它（见 clearParams） */}
           <Button id='btn-req-clear' variant='destructive'
-            onClick={() => { void shared().wbRequestClearModal?.open?.() }}>清理</Button>
+            onClick={() => { void shared().wbRequestClearModal?.open?.() }}>{t('清理')}</Button>
         </div>
       </div>
 
@@ -1203,15 +1347,15 @@ function RequestsPage() {
           {/* 时间档位用组件库的 SegmentedControl（不再经 wbSegmented 挂载点）。shrink-0 补的是旧
               CSS `.log-filters .seg { flex: 0 0 auto }`：新控件没有 .seg 类，不补会被压扁 */}
           <SegmentedControl options={RANGE_OPTIONS} value={range} onValueChange={onRangeChange}
-            aria-label='请求日志时间范围' className='shrink-0' />
+            aria-label={t('请求日志时间范围')} className='shrink-0' />
           {/* min-w-[120px] 补的是旧 CSS `.log-filters select { width: auto; min-width: 120px }`：
               原生 select 换成按钮触发器后那条规则不再命中；#req-provider / #req-model 的 max-width
               仍在 page-requests.css 里按 id 命中。展示文案显式给 SelectValue（不依赖 value 自动显示） */}
           <Select value={filters.status} disabled={runningOnly}
             onValueChange={next => onSelectChange({ status: String(next ?? '') })}>
             <SelectTrigger id='req-status' className='min-w-[120px]'
-              title={runningOnly ? '「仅看进行中」开启时，状态固定为进行中' : '按请求结果筛选'}
-              aria-label='按请求结果筛选'>
+              title={runningOnly ? t('「仅看进行中」开启时，状态固定为进行中') : t('按请求结果筛选')}
+              aria-label={t('按请求结果筛选')}>
               <SelectValue>
                 {STATUS_OPTIONS.find(item => item.value === filters.status)?.label ?? ALL_STATUS_LABEL}
               </SelectValue>
@@ -1225,7 +1369,7 @@ function RequestsPage() {
           <Select value={filters.provider}
             onValueChange={next => onSelectChange({ provider: String(next ?? '') })}>
             <SelectTrigger id='req-provider' className='min-w-[120px]'
-              title='按提供商筛选（只列日志里出现过的）' aria-label='按提供商筛选'>
+              title={t('按提供商筛选（只列日志里出现过的）')} aria-label={t('按提供商筛选')}>
               <SelectValue>
                 {filters.provider
                   ? (providerSelectOptions.find(item => item.value === filters.provider)?.label || filters.provider)
@@ -1242,7 +1386,7 @@ function RequestsPage() {
           <Select value={filters.model}
             onValueChange={next => onSelectChange({ model: String(next ?? '') })}>
             <SelectTrigger id='req-model' className='min-w-[120px]'
-              title='按模型筛选（只列日志里出现过的；精确匹配模型名）' aria-label='按模型筛选'>
+              title={t('按模型筛选（只列日志里出现过的；精确匹配模型名）')} aria-label={t('按模型筛选')}>
               <SelectValue>{filters.model || ALL_MODEL_LABEL}</SelectValue>
             </SelectTrigger>
             <SelectContent>
@@ -1258,7 +1402,7 @@ function RequestsPage() {
               都由组件库给，不再手写类名。互斥规则不变：开启时状态下拉停用（见上面那颗 Select） */}
           <Toggle id='btn-req-running' variant='outline' size='default' pressed={runningOnly}
             onPressedChange={onRunningOnlyChange}
-            title='只显示正在转发中的请求（状态列按阶段显示：连接中 / 等待响应 / 响应中 / 重试中，用时列显示已用时）'>仅看进行中</Toggle>
+            title={t('只显示正在转发中的请求（状态列按阶段显示：连接中 / 等待响应 / 响应中 / 重试中，用时列显示已用时）')}>{t('仅看进行中')}</Toggle>
           <div className='spacer' />
           <span className='panel-sub' id='req-summary'>{summaryParts.join(' · ')}</span>
         </div>
@@ -1275,16 +1419,21 @@ function RequestsPage() {
         </div>
       </div>
 
-      <div className='panel-foot'>
-        <span>上报的是网关报文里的模型名，别名 / 映射后的名字按上游收到的那次记录</span>
-        <span>账号为空表示请求在选定账号之前就失败了</span>
-        <div className='spacer' />
-        {/* 分页器交给组件库的 Pager：两颗按钮的边界判断（首页不能退、末页不能进）与「第 N / M 页」
-            读数都在它里面，读数用等宽数字。className 保留 .log-pager —— 底栏的间距与「窄窗口整组
-            换行」由 page-logs.css 那条规则分配。旧的三颗 id（btn-req-prev / btn-req-next /
-            req-page-info）随组件一起去掉，全仓 grep 过：没有别处查询它们 */}
-        <Pager page={currentPage} pageCount={pageCount} onPageChange={gotoPage} className='log-pager' />
-      </div>
+      {/* 页脚分页栏交给通用表格外壳（table-shell.tsx）：读数 / 每页条数 / 跳页 /
+          翻页器四件事五张表同一套。这里走的是**服务端真分页** —— 翻页与换档位都
+          真打接口（offset/limit 由后端执行），所以不给「全部」那一档；组件本身不
+          管页码，只管渲染 */}
+      <TableFooter
+        total={data.matched}
+        range={{ start: pageRangeStart, end: pageRangeEnd }}
+        page={currentPage}
+        pageCount={pageCount}
+        size={pageSize}
+        sizes={PAGE_SIZES}
+        onSizeChange={onPageSizeChange}
+        onPageChange={gotoPage}
+        disabled={!data.loaded && !data.error}
+      />
     </section>
   )
 }

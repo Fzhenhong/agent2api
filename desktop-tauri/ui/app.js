@@ -1,8 +1,14 @@
 /* Agent2API · 桌面端渲染层 */
-/* global workbuddyDesktop */
+/* global workbuddyDesktop, wbI18n */
 
 const api = window.workbuddyDesktop;
 const $ = id => document.getElementById(id);
+/**
+ * 是不是「网页端」形态（headless / Docker：面板由网关自己托管）。
+ * 判定口径与 titlebar.js 一致 —— 桥接层注入的 platform 为 'web' 即网页端；
+ * 桥还没就绪时按桌面形态处理（保守：桌面才是自绘窗口按钮那一套）。
+ */
+const isWebPanel = () => api?.platform === 'web';
 let state = null;
 // 最近一次 `refresh()` 的失败原因（成功时清空）。
 // 它是给顶栏状态区挂 title 用的：后端不可达时页面上其余数字都只是「上一次的值」，
@@ -72,24 +78,73 @@ function applyTheme(mode) {
   document.querySelectorAll('#theme-switch button').forEach(item => {
     item.classList.toggle('active', item.dataset.mode === mode);
   });
+  // 通知其它控制面（设置页「显示 → 显示模式」那组档位）：主题有两个入口
+  // （侧边栏三键与设置页），谁改了都要让另一处跟上 —— 事件单向广播，
+  // 两边都不去读对方的状态。detail 是本函数最初收到的 mode 原值。
+  window.dispatchEvent(new CustomEvent('wb:theme', { detail: mode }));
+}
+
+// ─── 界面缩放 ────────────────────────────────
+// 「显示 → 界面缩放」：80%–130%、一档 5%（共 11 档，设置页的下拉就是这份口径）。
+//
+// app.js 是缩放的**唯一应用入口**（与主题同一取向）：设置页只调 wbApp.applyZoom
+// 并听 'wb:zoom' 事件，不自己碰 localStorage、也不直接调桥 —— 缩放要落到
+// WebView 层（壳命令 set_zoom，语义与浏览器 Ctrl +/- 相同），那是页面脚本
+// 之外的事，由这里统一转达。
+const ZOOM_KEY = 'workbuddy-desktop-zoom';
+const ZOOM_MIN = 80;
+const ZOOM_MAX = 130;
+const ZOOM_STEP = 5;
+
+/** 从 localStorage 读一个百分数：缺失 / 空白 / 非数字都算「没设过」，返回 null */
+function readStoredPercent(key) {
+  const text = localStorage.getItem(key);
+  // 空串要单独挡：Number('') 是 0（不是 NaN），不挡就会被当成「0%」一路夹到 80%
+  if (text === null || text.trim() === '') return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** 读上次的缩放（百分数）：越界 / 非档位值 / 读不到一律回落 100（不写回，等下次显式设置） */
+function storedZoom() {
+  const raw = readStoredPercent(ZOOM_KEY);
+  if (raw === null) return 100;
+  const snapped = Math.round(raw / ZOOM_STEP) * ZOOM_STEP;
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, snapped));
+}
+
+function applyZoom(percent) {
+  const raw = Number(percent);
+  if (!Number.isFinite(raw)) return;
+  const value = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(raw / ZOOM_STEP) * ZOOM_STEP));
+  localStorage.setItem(ZOOM_KEY, String(value));
+  // 浏览器直开（网页端）时没有桥：可选链静默跳过 —— 那边的缩放归浏览器自己的
+  // Ctrl +/-，设置页同一项也是禁用状态（见 DisplayPane）。
+  try {
+    window.workbuddyDesktop?.setZoom?.(value / 100);
+  } catch { /* 非桌面环境忽略 */ }
+  window.dispatchEvent(new CustomEvent('wb:zoom', { detail: value }));
 }
 
 // ─── 页面导航 ────────────────────────────────
 
 const PAGE_KEY = 'workbuddy-desktop-page';
-const PAGES = ['overview', 'accounts', 'gateway', 'keys', 'docs', 'logs', 'tasks', 'requests', 'settings'];
+const PAGES = ['assistant', 'overview', 'accounts', 'checkin', 'gateway', 'proxies', 'keys', 'docs', 'logs', 'tasks', 'requests', 'settings'];
 /** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」、gateway 的是「模型管理」
  *  （内部标识保持不变：localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它） */
 const PAGE_LABELS = {
-  overview: '报表',
-  accounts: '账号',
-  gateway: '模型管理',
-  keys: '网关 Key',
-  docs: '文档',
-  logs: '日志',
-  tasks: '定时任务',
-  requests: '请求日志',
-  settings: '设置',
+  assistant: wbI18n.t('AI 助手'),
+  overview: wbI18n.t('报表'),
+  accounts: wbI18n.t('账号'),
+  checkin: wbI18n.t('签到中心'),
+  gateway: wbI18n.t('模型管理'),
+  proxies: wbI18n.t('网络代理'),
+  keys: wbI18n.t('网关 Key'),
+  docs: wbI18n.t('文档'),
+  logs: wbI18n.t('日志'),
+  tasks: wbI18n.t('定时任务'),
+  requests: wbI18n.t('请求日志'),
+  settings: wbI18n.t('设置'),
 };
 
 /** 当前页（子模块据此判断是否需要重新加载） */
@@ -106,12 +161,20 @@ function showPage(name, { persist = true } = {}) {
   });
   const crumb = $('crumb-page');
   if (crumb) crumb.textContent = PAGE_LABELS[page] || page;
+  // 移动端：切页后收起侧边栏抽屉。#nav-toggle 是纯 CSS 开关（见 css/mobile.css），
+  // 点导航项只切页不 uncheck，抽屉会一直开着；桌面端该元素恒为 unchecked，这行无副作用。
+  { const t = document.getElementById('nav-toggle'); if (t) t.checked = false; }
   if (persist) localStorage.setItem(PAGE_KEY, page);
   // 列的设置面板常驻 body（.panel 是 overflow:hidden，留在原处会被裁掉，
   // 见 table-col-settings.js），不随宿主页面的 display:none 一起消失 ——
   // 不收起的话，切页之后它会孤零零地浮在新页面上。它自己不认识「页面」，
   // 由切页这一处统一告诉它。
   window.wbColSettings?.close?.();
+  // 切到 AI 助手页时唤醒会话（岛的初始化可能晚于首屏的 showPage —— 它要等
+  // islands/ui.js 加载完；activate 自己判重，早调晚调都只初始化一次）
+  if (page === 'assistant') {
+    window.wbAssistant?.activate?.();
+  }
   // 切到报表页时拉一次统计（面板内部自持时间范围与数据，这里只做转发）
   if (page === 'overview') {
     window.wbReport?.load?.();
@@ -130,6 +193,10 @@ function showPage(name, { persist = true } = {}) {
   if (page === 'tasks') {
     window.wbTasksPanel?.load?.();
   }
+  // 签到中心自持数据（聚合快照 + 惰性查询缓存），切进去时拉一次最新
+  if (page === 'checkin') {
+    void window.wbCheckinPanel?.load?.();
+  }
   // 切到设置页时拉一次启动设置与网关地址（面板内部自持状态，这里只做转发）
   if (page === 'settings') {
     window.wbSettingsPanel?.load?.();
@@ -140,6 +207,11 @@ function showPage(name, { persist = true } = {}) {
   // 这里只转发 —— 它自己保证「切页这次刷新一定落地」。
   if (page === 'gateway') {
     void window.wbModelsPanel?.refreshAll?.();
+  }
+  // 网络代理页自持清单（代理池），切进去时拉一次最新：别的窗口 / 别的页面
+  // （账号弹窗里改过引用）都可能让它变过。面板内部保证「这次刷新一定落地」
+  if (page === 'proxies') {
+    void window.wbProxiesPanel?.load?.();
   }
   // 切到账号页时立刻补一次连接数：那条 2 秒轮询只在「当时就在账号页」时才发请求，
   // 切走的这段时间里缓存已经过期，不补一下会先看到几秒前的旧数字
@@ -174,9 +246,16 @@ function renderTopbarStatus() {
   const session = state?.session || {};
   const accounts = state?.accounts?.accounts || [];
   const enabled = accounts.filter(a => a.enabled !== false).length;
-  // accounts-model.js 在 app.js 之后加载，首屏这次调用可能早于它就绪，故用可选链
-  const isRateLimited = window.wbAccountsModel?.isRateLimited;
-  const limited = isRateLimited ? accounts.filter(a => a.enabled !== false && isRateLimited(a)).length : 0;
+  // 「可用」= 启用且凭证完整。`available` 就是后端选路用的那个键
+  // （account_store 的 public_account 写的），所以徽章与「转发时会不会用这个账号」
+  // 同一判据；缺该键的老数据按可用处理（宁可不误报「不可用」）。
+  const available = accounts.filter(a => a.enabled !== false && a.available !== false).length;
+  // accounts-model.js 在 app.js 之后加载，首屏这次调用可能早于它就绪，故用可选链。
+  // 计数用 isLimited（含「余额不足已跳过」档，与账号页「已限流」分段同一口径）；
+  // 契约上没有该成员时退回 isRateLimited（只数模型限流），宁少报不报错
+  const modelApi = window.wbAccountsModel;
+  const isLimited = modelApi?.isLimited || modelApi?.isRateLimited;
+  const limited = isLimited ? accounts.filter(a => a.enabled !== false && isLimited(a)).length : 0;
   // 「网关运行中」用的是**网关进程**的判据（壳侧 is_ready 探测，见 port-panel.js），
   // 不是 upstreamConfigured（那个说的是有没有账号）。两者会独立变化：没账号不影响
   // 网关监听，端口被占也不影响账号存在 —— 混用会让用户对着「未就绪」去查账号。
@@ -197,27 +276,40 @@ function renderTopbarStatus() {
   };
 
   const views = {
-    accounts: () => chip(`${enabled} 个启用`, enabled ? 'ok' : '')
-      + (limited ? chip(`${limited} 个已限流`, 'warn') : ''),
-    gateway: () => (gatewayUp ? chip('监听 127.0.0.1', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
+    accounts: () => chip(wbI18n.t('{n} 个启用', { n: enabled }), enabled ? 'ok' : '')
+      + (limited ? chip(wbI18n.t('{n} 个已限流', { n: limited }), 'warn') : ''),
+    // 「监听 127.0.0.1」只在桌面模式成立：web 模式（Docker / 反代）下网关监听的是
+    // 容器内的 0.0.0.0，面板访问它走的是映射 / 代理后的地址 —— 那里照实说「网关运行中」
+    // 就好，后面的 port 徽标给的才是真正的地址。（文案复用已有的同一句话，不新增键）
+    gateway: () => (gatewayUp
+      ? chip(isWebPanel() ? wbI18n.t('网关运行中') : wbI18n.t('监听 127.0.0.1'), 'ok')
+      : chip(wbI18n.t('未就绪'), 'bad')) + chip(port, '', true),
     keys: () => mirror('keys-status'),
     // 文档页没有自己的徽标（它只有一组复制的地址），跟着网关的运行状态走 ——
     // 地址在页面上的意义就是「现在能不能连」，网关没起来时那个状态最要紧
-    docs: () => (gatewayUp ? chip('网关运行中', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
+    docs: () => (gatewayUp ? chip(wbI18n.t('网关运行中'), 'ok') : chip(wbI18n.t('未就绪'), 'bad')) + chip(port, '', true),
     logs: () => mirror('logs-badge'),
     requests: () => mirror('req-badge'),
     // 定时任务页的徽标由 tasks-panel 自己渲染（「N / M 个已开启」），直接镜像
     tasks: () => mirror('tasks-badge'),
-    settings: () => (gatewayUp ? chip('网关运行中', 'ok', true) : chip('未就绪', 'bad', true))
-      + (enabled ? chip(`${enabled} 个账号启用`) : ''),
-    overview: () => (gatewayUp ? chip('网关运行中', 'ok') : chip('未就绪', 'bad'))
-      + (session.loggedIn ? chip('已登录', 'ok') : chip('未登录', 'warn')),
+    // 签到中心的徽标由 checkin-page 自己渲染（自动签到开启状态），直接镜像
+    checkin: () => mirror('checkin-badge'),
+    settings: () => (gatewayUp ? chip(wbI18n.t('网关运行中'), 'ok', true) : chip(wbI18n.t('未就绪'), 'bad', true))
+      + (enabled ? chip(wbI18n.t('{n} 个账号启用', { n: enabled })) : ''),
+    // 「已登录 / 未登录」说的是**旧式单账号登录态**（WorkBuddy 的 auth.json），
+    // 它与「能不能转发」在库模式下是两件事：没有 WorkBuddy 账号的多账号部署会
+    // 恒显黄色「未登录」，而路由、转发、签到一切正常（issue #178）。有可用账号时
+    // 报账号数；一个可用账号都没有才回落登录态 —— 那时「未登录」是准确的说法。
+    overview: () => (gatewayUp ? chip(wbI18n.t('网关运行中'), 'ok') : chip(wbI18n.t('未就绪'), 'bad'))
+      + (available
+        ? chip(wbI18n.t('{n} 个账号可用', { n: available }), 'ok')
+        : (session.loggedIn ? chip(wbI18n.t('已登录'), 'ok') : chip(wbI18n.t('未登录'), 'warn'))),
   };
 
   box.innerHTML = views[currentPage]?.() ?? views.overview();
   // 加载失败的原因挂在这里（会话状态卡片删除后它没有别的落点）：此时下面各页面
   // 显示的都是上一次的值，顶栏是唯一常驻可见的位置。成功一次即清空。
-  box.title = stateError ? `加载失败：${stateError}` : '';
+  box.title = stateError ? wbI18n.t('加载失败：{error}', { error: stateError }) : '';
 }
 
 // ─── 日志未读徽标（只提示 error） ─────────────
@@ -315,7 +407,7 @@ async function refreshUnreadErrors(badge) {
       return;
     }
     badge.textContent = unread > 99 ? '99+' : String(unread);
-    badge.title = `${unread} 条错误日志未读，点开「日志」查看`;
+    badge.title = wbI18n.t('{n} 条错误日志未读，点开「日志」查看', { n: unread });
     badge.style.display = '';
   } catch {
     // 保持上一次的显示
@@ -400,7 +492,7 @@ function paintRequestsBadge() {
   }
   if (runningRequests > 0) {
     badge.textContent = runningRequests > 99 ? '99+' : String(runningRequests);
-    badge.title = `${runningRequests} 个请求正在转发中，点开「请求日志」查看`;
+    badge.title = wbI18n.t('{n} 个请求正在转发中，点开「请求日志」查看', { n: runningRequests });
     badge.style.display = '';
     // 类名用 is-running 而不是 live：layout.css 里 .live 是**侧栏状态灯**
     // （7px 圆点 + 绿底 + 光晕），加上它会把这颗数字角标压成小圆点 ——
@@ -411,7 +503,7 @@ function paintRequestsBadge() {
   badge.classList.remove('is-running');
   if (unreadFailures > 0) {
     badge.textContent = unreadFailures > 99 ? '99+' : String(unreadFailures);
-    badge.title = `${unreadFailures} 条失败请求未读，点开「请求日志」查看`;
+    badge.title = wbI18n.t('{n} 条失败请求未读，点开「请求日志」查看', { n: unreadFailures });
     badge.style.display = '';
     return;
   }
@@ -507,9 +599,11 @@ function syncUpdateBadge() {
   }
   // 只放一个「新」字而不是数字：这里没有「未读条数」的含义，
   // 写成数字容易被误会成还有多少个版本可以更新
-  badge.textContent = '新';
-  badge.title = `发现新版本 ${latest}（当前 ${info.currentVersion || '未知'}），`
-    + '点开「设置 - 软件更新」可查看更新日志并下载';
+  badge.textContent = wbI18n.t('新');
+  badge.title = wbI18n.t('发现新版本 {latest}（当前 {current}），点开「设置 - 软件更新」可查看更新日志并下载', {
+    latest,
+    current: info.currentVersion || wbI18n.t('未知'),
+  });
   badge.style.display = '';
 }
 
@@ -517,10 +611,13 @@ function syncUpdateBadge() {
 function updateUpdateBadge(info) {
   lastUpdateInfo = info || null;
   syncUpdateBadge();
-  // 「检测到更新」弹窗已迁到组件库（见 ui-islands/src/islands/update-panel.tsx）：
-  // 弹与不弹的判定（跳过此次更新的版本号 / 本会话已弹过 / 人已在设置页）与弹窗本体
-  // 都在那边，这里只把结果递过去。app.js 不再持有弹窗 DOM、跳过键与会话守卫 ——
-  // 那套状态若两边各留一份，判定必然漂移（这正是本次迁移要避免的）。
+  // 结果递给软件更新面板（另一个岛，见 ui-islands/src/islands/update-panel.tsx）：
+  //   · applyStatus：把这份读数铺进面板。后端定时任务查到的新版本、新的检查时刻，
+  //     不该等到用户手点一次「检查更新」才出现；
+  //   · showUpdateModal：「检测到更新」弹窗。弹与不弹的判定（跳过此次更新的版本号 /
+  //     本会话已弹过 / 人已在设置页）与弹窗本体都在那边 —— app.js 不再持有弹窗 DOM、
+  //     跳过键与会话守卫，那套状态若两边各留一份，判定必然漂移。
+  window.wbUpdatePanel?.applyStatus?.(info);
   window.wbUpdatePanel?.showUpdateModal?.(info);
 }
 
@@ -546,10 +643,12 @@ function renderProxyStatus() {
   // 这里说的是「上游凭证」（有没有可用账号），与网关进程是否在监听是两件事，
   // 所以措辞明确指向账号 —— 别再说成「代理不可用」（那会让人去查端口）
   if (!health?.upstreamConfigured) {
-    box.innerHTML = `<span style="color:var(--danger)">无可用账号：${esc(health?.unavailableReason || '尚未登录')}</span>`;
+    box.innerHTML = wbI18n.t('<span style="color:var(--danger)">无可用账号：{reason}</span>', {
+      reason: esc(health?.unavailableReason || wbI18n.t('尚未登录')),
+    });
     return;
   }
-  box.textContent = `运行正常 · ${health.upstreamBaseUrl || ''}`;
+  box.textContent = wbI18n.t('运行正常 · {url}', { url: health.upstreamBaseUrl || '' });
 }
 
 function render() {
@@ -636,7 +735,7 @@ async function refresh() {
   }
 }
 
-// ─── 账号操作（列表按钮统一入口；积分/签到由 accounts-view 自行消化） ───
+// ─── 账号操作（列表按钮统一入口；余额查询由账号视图自行消化） ───
 
 async function runAccountAction(action, id) {
   if (busy) return;
@@ -650,29 +749,32 @@ async function runAccountAction(action, id) {
     if (action === 'switch') {
       const result = await api.switchAccount(id);
       await refresh();
-      toast(result?.changed === false ? '账号已在全局队列第一位' : '✅ 已将账号优先级调整到全局第一位');
+      toast(result?.changed === false
+        ? wbI18n.t('账号已在全局队列第一位')
+        : wbI18n.t('✅ 已将账号优先级调整到全局第一位'));
     } else if (action === 'refresh') {
       await api.refreshAccountToken(id);
       await refresh();
-      toast('✅ Token 已刷新');
+      toast(wbI18n.t('✅ Token 已刷新'));
     } else if (action === 'remove') {
       const account = state?.accounts?.accounts?.find(a => a.id === id);
-      const name = esc(account?.nickname || account?.name || id);
+      // 与岛内 displayNameOf 同一口径：nameCustom 恒赢，未打标维持旧口径（昵称优先）
+      const name = esc(account?.nameCustom && account?.name ? account.name : (account?.nickname || account?.name || id));
       // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），
       // 危险确认一律走自绘弹窗（wbConfirm，见 confirm-dialog.js）—— 下同
-      const note = window.wbAccountsModel?.isDesktopAccount?.(account) ? '（不会影响客户端登录态）' : '';
+      const note = window.wbAccountsModel?.isDesktopAccount?.(account) ? wbI18n.t('（不会影响客户端登录态）') : '';
       if (!(await window.wbConfirm?.ask?.({
-        title: '删除账号',
-        html: `确定删除账号「<strong>${name}</strong>」？${esc(note)}`,
-        okText: '删除',
+        title: wbI18n.t('删除账号'),
+        html: wbI18n.t('确定删除账号「<strong>{name}</strong>」？{note}', { name, note: esc(note) }),
+        okText: wbI18n.t('删除'),
         okClass: 'danger',
       }))) return;
       await api.removeAccount(id);
       await refresh();
-      toast('账号已删除');
+      toast(wbI18n.t('账号已删除'));
     }
   } catch (error) {
-    toast(`操作失败：${error.message}`, 'err');
+    toast(wbI18n.t('操作失败：{message}', { message: error.message }), 'err');
   } finally {
     releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
   }
@@ -690,6 +792,10 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () 
   if ((localStorage.getItem('workbuddy-desktop-theme') || 'system') === 'system') applyTheme('system');
 });
 applyTheme(localStorage.getItem('workbuddy-desktop-theme') || 'system');
+// 界面缩放同样在这里落一次（index.html 的头部内联脚本已按同一份 localStorage
+// 抢先交过一次，见那边的说明）：这里这行是**权威**的一次 —— 头部那次只是
+// 尽力而为的反闪烁，若桥当时还没就绪就会静默失败，由这行补齐。
+applyZoom(storedZoom());
 
 api.onStateChanged(next => {
   if (!next?.accounts && !next?.session && !next?.health) return;
@@ -713,6 +819,10 @@ window.wbApp = {
   syncLogsBadge,
   // 软件更新面板在每次检查结束后回调它，把「有新版本」翻译成导航上的提示
   updateUpdateBadge,
+  // 显示偏好（设置页「显示」分类的两个入口）：主题与缩放都只有这一处实现，
+  // 设置页改完调这里，再靠 'wb:theme' / 'wb:zoom' 事件跟随变化
+  applyTheme,
+  applyZoom,
 };
 
 // ─── 账号的自动维护结果 ───────────────────────
@@ -758,12 +868,32 @@ paintIcons();
 // 一整套弹窗交互，留在本文件会让这里继续膨胀。本文件只负责在 render()
 // 里委托它重画，并在首屏主动问一次后端状态。
 
-showPage(localStorage.getItem(PAGE_KEY) || 'overview', { persist: false });
+// ─── 初始页恢复：必须等 islands bundle 注册完 ───────────────
+// app.js 在 index.html 里排在 islands/ui.js **之前**，而各页面的数据加载由
+// showPage 里「切到某页时拉一次」完成。若在这里同步恢复上次页面，此刻 ui.js
+// 还没执行、wbSettingsPanel 等岛方法都不存在，`?.` 会把这次加载静默吞掉 ——
+// 恢复页是「设置」时，启动设置就永远停在「检测中…」（局域网开关随之显示
+// 默认值，看着像没保存）。DOMContentLoaded 在全部同步脚本执行完才触发，
+// 借它把初始切换对齐到「岛已就绪」之后，与用户手动切页完全同行为。
+const initialPage = localStorage.getItem(PAGE_KEY) || 'overview';
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    showPage(initialPage, { persist: false });
+    restorePortPanel();
+  }, { once: true });
+} else {
+  showPage(initialPage, { persist: false });
+  restorePortPanel();
+}
 
 refresh();
-// 首屏就问一次后端状态：此时 state 还没回来，侧栏两条状态各自显示
-// 「正在检查…」，拿到结果后立刻变成真值（端口冲突会直接给出失败原因）
-void window.wbPortPanel?.sync?.();
+
+/** 首屏问一次后端状态：此时 state 还没回来，侧栏两条状态各自显示
+ * 「正在检查…」，拿到结果后立刻变成真值（端口冲突会直接给出失败原因）。
+ * port-panel 也是岛，同样要等注册完，所以与初始页恢复放在一起。 */
+function restorePortPanel() {
+  void window.wbPortPanel?.sync?.();
+}
 
 /**
  * 启动即把更新状态铺一次：读**后端缓存**里的最近一次检查结果（定时任务按间隔
@@ -791,7 +921,22 @@ document.addEventListener('DOMContentLoaded', () => {
   // 它**不是**更新检查那种「有新版本就提示」的可选动作 —— 没升级时账号是空的，
   // 所以过程与结果都要 toast 报出来，不能让用户面对一个「账号怎么空了」的疑问。
   void window.wbUpgradePanel?.check?.();
+  // 启动即读一次后端的余额结果快照（每账号自动查询的最新结论，重启也在），
+  // 只靠下面那条 20 秒轮询的话，用户启动后第一眼看到的是账号页一片「未查询」，
+  // 要等最久一整轮才变出余额 —— 那正是「定时查询好像没生效、必须手动点」的来源。
+  // 放在 DOMContentLoaded：islands（wbAccountsView 的注册处，见 index.html 的
+  // 加载顺序）是同步脚本，此刻已经就位。
+  void window.wbAccountsView?.syncBalancesSnapshot?.();
 }, { once: true });
+
+// 窗口重新可见时立刻补读一次余额快照：20 秒轮询在页面隐藏期间整体跳过
+// （见下面 setInterval 的 document.hidden 判定），恢复可见的瞬间界面上还是
+// 隐藏前的旧读数 —— 这一下让用户切回来就看到定时任务的最近一轮结果。
+// 快照时间戳没变时 syncBalancesSnapshot 自己会早退，重复触发没有代价。
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  void window.wbAccountsView?.syncBalancesSnapshot?.();
+});
 
 // 定时轮询：限额标记（429 + 恢复时间）与账号状态变化自动刷新；窗口隐藏时暂停
 setInterval(() => {
@@ -805,7 +950,7 @@ setInterval(() => {
   void syncLogsBadge();
   // 请求日志的未读失败同理：人不在请求日志页时也要有人推进角标
   void syncRequestsBadge();
-  // 「定时查询积分」的结果快照也跟着这一轮读一次：后端的定时任务在跑，
+  // 余额快照也跟着这一轮读一次：后端的每账号自动查询在跑，
   // 界面得跟上它（否则用户不点按钮就永远停在启动那次的旧余额上）。
   // 快照时间戳没变时它自己会早退，不会造成无谓的重绘。
   void window.wbAccountsView?.syncBalancesSnapshot?.();

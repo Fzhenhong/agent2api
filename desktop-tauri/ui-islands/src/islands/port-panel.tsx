@@ -12,6 +12,7 @@ import {
   Input,
   Label,
 } from '@ui'
+import { t } from '../i18n'
 
 /**
  * Agent2API · 端口状态面板（React 岛）。
@@ -67,6 +68,33 @@ import {
 const FALLBACK_PORT = 3065
 
 /**
+ * web 模式（面板由网关自己托管）下**地址栏就是权威的网关地址**。
+ *
+ * 为什么不能沿用「壳侧上报的端口」：`getBackendStatus` 给的是**进程自己监听的端口**，
+ * 而 Docker 端口映射、反向代理、内网穿透之后，外面的真实地址进程从原理上不可知
+ * —— 拿容器内的 `127.0.0.1:3065` 拼出来的地址，指向的是访问者自己的电脑。浏览器
+ * 自带的那一份（`location.origin`）天然穿透这三层，是唯一正确的答案。
+ *
+ * 项目自己已经这么用过：小浣熊网页登录的回调 URL 就是用 `location.origin` 拼的
+ * （`web_shim::buildRaccoonWebAuthUrl`）。两处口径从这里起一致。
+ *
+ * **桌面模式必须保持现状**：那时 origin 是 Tauri 的自定义协议（`tauri://localhost`
+ * 之类），不是网关地址，真端口只能问壳侧。所以这个函数在非 web 模式返回 null，
+ * 由调用方回落到端口路径。
+ */
+function webOrigin(): string | null {
+  if (shared().workbuddyDesktop?.platform !== 'web') return null
+  const origin = typeof window === 'undefined' ? '' : window.location?.origin
+  // 非 http(s) 场景（file:// 等）origin 是字面量 "null"，那不是可用地址
+  return origin && origin !== 'null' ? origin : null
+}
+
+/** 本次该展示的网关基址：web 模式信地址栏，桌面模式用壳侧上报的真实端口 */
+function gatewayBaseFor(port: number, current: string): string {
+  return webOrigin() ?? (port ? `http://127.0.0.1:${port}` : current)
+}
+
+/**
  * 壳侧 `backend_status` 返回的启动失败详情（Rust 的 StartupFailure，
  * camelCase 序列化）。`label` 是侧栏那一行用的短标签（「端口被占用」这类），
  * 由后端给 —— 界面不自己拼，否则侧栏、弹窗、日志里会出现三套说法。
@@ -105,6 +133,10 @@ type PortOccupantInfo = {
 
 /** 本岛用到的壳侧接口：端口探测、结束占用进程、写盘、重启（见 bridge.rs） */
 type PortBridge = {
+  /** 桥接层注入的平台标识（'windows' / 'macos' / 'linux' / 'web'）。
+   *  本面板读它是为了区分「网页端托管面板」与桌面壳 —— 两者算网关地址的
+   *  依据不同（见 webOrigin）。 */
+  readonly platform?: string
   getBackendStatus(): Promise<BackendStatus | null | undefined>
   getPortOccupant(): Promise<PortOccupantInfo | null | undefined>
   endPortOccupant(): Promise<{ released?: boolean } | null | undefined>
@@ -165,7 +197,9 @@ type PortSnapshot = {
 
 let snapshot: PortSnapshot = {
   backend: null,
-  gatewayBase: `http://127.0.0.1:${FALLBACK_PORT}`,
+  // web 模式下到这里就已经能拿到地址栏（web_shim 注入在 `<head>` 之后、所有界面脚本
+  // 之前），所以初值直接给真地址 —— 不必先闪一下 `127.0.0.1:3065` 再改成对的
+  gatewayBase: gatewayBaseFor(0, `http://127.0.0.1:${FALLBACK_PORT}`),
 }
 
 /** 快照的订阅者（当前只有状态条那一个 root） */
@@ -238,8 +272,9 @@ async function sync(): Promise<void> {
     const next: PortSnapshot = {
       // 就绪与否、失败原因都可能在这一刻变化；字段缺失按「没查过」处理
       backend: status ?? null,
-      // 取不到端口就保持原值：页面照常显示，不留空也不报错
-      gatewayBase: port ? `http://127.0.0.1:${port}` : current.gatewayBase,
+      // web 模式取地址栏（端口映射 / 反代 / 穿透后的真实地址）；桌面模式取端口，
+      // 取不到就保持原值：页面照常显示，不留空也不报错
+      gatewayBase: gatewayBaseFor(port, current.gatewayBase),
     }
     if (next.gatewayBase !== current.gatewayBase) paintGatewayAddress(next.gatewayBase)
     publish(next)
@@ -261,12 +296,12 @@ function render(): void {
 
 /** 重启应用（壳侧会拉起新进程）；提示语由调用方给，因为触发场景不同 */
 async function restartApp(message?: string): Promise<void> {
-  toast(message || '正在重启…')
+  toast(message || t('正在重启…'))
   try {
     await shared().workbuddyDesktop?.restartApp()
     // 重启会带走本进程，新窗口由壳侧拉起；这里不做后续处理
   } catch (error) {
-    toast(`重启失败：${errorMessage(error)}`, 'err')
+    toast(t('重启失败：{reason}', { reason: errorMessage(error) }), 'err')
   }
 }
 
@@ -276,9 +311,9 @@ async function restartApp(message?: string): Promise<void> {
 type EndPhase = 'idle' | 'querying' | 'ending'
 
 const END_LABELS: Record<EndPhase, string> = {
-  idle: '结束占用进程',
-  querying: '查询中…',
-  ending: '结束中…',
+  idle: t('结束占用进程'),
+  querying: t('查询中…'),
+  ending: t('结束中…'),
 }
 
 /**
@@ -304,23 +339,23 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
   // ── 状态灯与那一行文案：三种状态 + 「还没查过」 ──
   // 文案里的端口用 portLabel()（与顶栏徽标同一份读数），短标签由后端给
   let dotClass = 'live off'
-  let text = `正在检查… · ${port}`
+  let text = t('正在检查… · {port}', { port })
   if (ready === true) {
     dotClass = 'live pulse'
-    text = `网关运行中 · ${port}`
+    text = t('网关运行中 · {port}', { port })
   } else if (failure) {
     dotClass = 'live bad'
-    text = `${failure.label || '网关启动失败'} · ${port}`
+    text = t('{label} · {port}', { label: failure.label || t('网关启动失败'), port })
   } else if (ready === false) {
-    text = `网关启动中… · ${port}`
+    text = t('网关启动中… · {port}', { port })
   }
 
   /** 完整说明（可能上百字）只进 title 与弹窗：状态条只有一行 */
   const title = failure
     ? failure.message ?? ''
     : ready === true
-      ? `本地网关正在监听 ${gatewayBase}，可直接调用 OpenAI 兼容接口`
-      : '正在确认网关是否已就绪'
+      ? t('本地网关正在监听 {url}，可直接调用 OpenAI 兼容接口', { url: gatewayBase })
+      : t('正在确认网关是否已就绪')
 
   // 挂载时自问一次后端状态：app.js 的首屏 sync() 排在 islands/ui.js **之前**
   // 执行（index.html 里 app.js 先加载），那一次调用什么也没做（wbPortPanel
@@ -364,26 +399,26 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
       if (!occupant) {
         // 没查到进程：多半是系统保留段（那里根本没有进程可杀）。
         // 这里不引导用户去杀进程，直接把出路指向换端口。
-        toast(`端口 ${info?.port ?? ''} 上没有查到监听进程，请改用「更换端口」`, 'err')
+        toast(t('端口 {port} 上没有查到监听进程，请改用「更换端口」', { port: info?.port ?? '' }), 'err')
         return
       }
       const lines = [
-        '即将结束以下进程：',
+        t('即将结束以下进程：'),
         '',
-        `进程名：${occupant.name}`,
-        `PID：${occupant.pid}`,
-        `路径：${occupant.path || '（未知）'}`,
+        t('进程名：{name}', { name: String(occupant.name) }),
+        t('PID：{pid}', { pid: String(occupant.pid) }),
+        t('路径：{path}', { path: occupant.path || t('（未知）') }),
         '',
-        '结束它会强制退出该程序未保存的数据。确认继续？',
+        t('结束它会强制退出该程序未保存的数据。确认继续？'),
       ]
       // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认）——
       // 走自绘确认弹窗（wbConfirm）；text 形态内部会转义并保留换行
       const ask = shared().wbConfirm?.ask
       if (!ask) return
       const confirmed = await ask({
-        title: '结束占用端口的进程',
+        title: t('结束占用端口的进程'),
         text: lines.join('\n'),
-        okText: '结束进程',
+        okText: t('结束进程'),
         okClass: 'danger',
       })
       if (!confirmed) return
@@ -391,26 +426,29 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
       setPhase('ending')
       const result = await api.endPortOccupant()
       if (result?.released) {
-        toast(`已结束进程 ${occupant.name}（PID ${occupant.pid}），端口已释放`)
+        toast(t('已结束进程 {name}（PID {pid}），端口已释放', {
+          name: String(occupant.name),
+          pid: String(occupant.pid),
+        }))
         // 端口释放了，但网关还没起来（它启动时端口被占，已经放弃）。
         // 问一句是否现在重启，而不是替用户决定重启。
         if (
           await ask({
-            title: '重启程序',
-            text: '端口已释放。现在重启程序让网关用这个端口启动？',
-            okText: '重启',
+            title: t('重启程序'),
+            text: t('端口已释放。现在重启程序让网关用这个端口启动？'),
+            okText: t('重启'),
           })
         ) {
-          await restartApp('重启中…')
+          await restartApp(t('重启中…'))
         } else {
           await sync()
         }
       } else {
-        toast('进程已结束，但端口仍被占用，建议改用「更换端口」', 'err')
+        toast(t('进程已结束，但端口仍被占用，建议改用「更换端口」'), 'err')
         await sync()
       }
     } catch (error) {
-      toast(`结束失败：${errorMessage(error)}`, 'err')
+      toast(t('结束失败：{reason}', { reason: errorMessage(error) }), 'err')
     } finally {
       setPhase('idle')
     }
@@ -441,7 +479,7 @@ function SidebarStatus({ container }: { container: HTMLElement }) {
             </Button>
           ) : null}
           <Button size='sm' onClick={() => void openPortModal()}>
-            更换端口
+            {t('更换端口')}
           </Button>
         </div>
       ) : null}
@@ -476,9 +514,9 @@ function mountSidebarStatus(): void {
 type SavePhase = 'idle' | 'checking' | 'saving'
 
 const SAVE_LABELS: Record<SavePhase, string> = {
-  idle: '保存并重启',
-  checking: '校验中…',
-  saving: '保存中…',
+  idle: t('保存并重启'),
+  checking: t('校验中…'),
+  saving: t('保存中…'),
 }
 
 type PortModalProps = {
@@ -503,7 +541,7 @@ function PortModal({ status, onClose }: PortModalProps) {
   const selectOnFocusRef = React.useRef(true)
 
   const preview = Number(value) || 0
-  const statusText = status?.failure?.message || `当前端口 ${currentPort}，网关运行正常。`
+  const statusText = status?.failure?.message || t('当前端口 {port}，网关运行正常。', { port: currentPort })
 
   /**
    * 保存新端口并重启：**先探测、再写盘、再重启**（顺序照旧，别调换）。
@@ -524,7 +562,7 @@ function PortModal({ status, onClose }: PortModalProps) {
     // 归一：number 输入框的 value 可能是空串 / 'abc'（Number → NaN），一律按 0
     const port = Number(value) || 0
     if (!port || port < 1024 || port > 65535) {
-      setMessage('端口需在 1024-65535 之间')
+      setMessage(t('端口需在 1024-65535 之间'))
       return
     }
 
@@ -535,7 +573,7 @@ function PortModal({ status, onClose }: PortModalProps) {
       const check = await api.checkPort(port)
       if (!check?.ok) {
         // 不可用的原因由后端给（含「被系统保留」的完整说明），直接显示
-        setHint(check?.message || '该端口不可用')
+        setHint(check?.message || t('该端口不可用'))
         return
       }
       if (check.same) {
@@ -545,11 +583,11 @@ function PortModal({ status, onClose }: PortModalProps) {
       setPhase('saving')
       const result = await api.changePort(port)
       if (result?.changed === false) {
-        setHint('与当前端口相同，无需重启')
+        setHint(t('与当前端口相同，无需重启'))
         return
       }
       onClose()
-      await restartApp(`端口已改为 ${port}，正在重启…`)
+      await restartApp(t('端口已改为 {port}，正在重启…', { port }))
     } catch (error) {
       setMessage(errorMessage(error))
     } finally {
@@ -563,22 +601,22 @@ function PortModal({ status, onClose }: PortModalProps) {
     <Dialog open onOpenChange={next => { if (!next) onClose() }}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>更换网关端口</DialogTitle>
+          <DialogTitle>{t('更换网关端口')}</DialogTitle>
         </DialogHeader>
         <DialogBody>
           <DialogSection>
-            <h3>当前状态</h3>
+            <h3>{t('当前状态')}</h3>
             {/* 完整说明由后端给（状态条那行塞不下），这里原样显示 */}
             <p>{statusText}</p>
           </DialogSection>
 
           <DialogSection>
-            <h3>新端口</h3>
+            <h3>{t('新端口')}</h3>
             {/* 原来是 .field-row（标签自然宽度 + 控件吃剩余），这里用同样的
                 弹性行表达；数字输入框由 ui/css 的 input[type=number] 限宽 130px */}
             <div className='flex flex-wrap items-center gap-2.5'>
               <Label htmlFor='port-input' className='text-[12.5px] whitespace-nowrap text-subtle'>
-                端口号
+                {t('端口号')}
               </Label>
               <Input
                 id='port-input'
@@ -586,7 +624,7 @@ function PortModal({ status, onClose }: PortModalProps) {
                 min={1024}
                 max={65535}
                 step={1}
-                placeholder='例如 3066'
+                placeholder={t('例如 3066')}
                 autoComplete='off'
                 className='max-w-[130px]'
                 value={value}
@@ -603,15 +641,17 @@ function PortModal({ status, onClose }: PortModalProps) {
               />
             </div>
             {hint ? <p>{hint}</p> : null}
-            <p>端口需在 1024-65535 之间。1023 及以下是系统保留范围，普通程序无法监听。</p>
+            <p>{t('端口需在 1024-65535 之间。1023 及以下是系统保留范围，普通程序无法监听。')}</p>
           </DialogSection>
 
           <DialogSection>
-            <h3>换端口后要改的地方</h3>
+            <h3>{t('换端口后要改的地方')}</h3>
+            {/* 内联 <code> 是协议关键字、不进词典；两边中文碎片各自走 t()
+                （与 docs-page.tsx 同一条手法：整句塞一个键就保不住行内强调） */}
             <p>
-              网关地址会变成 <code>{`http://127.0.0.1:${preview || '—'}`}</code>。
-              已经把这个地址填进其它工具（Claude Code、Cherry Studio 等）的，
-              需要一并改成新地址，否则那些工具会连不上。
+              {t('网关地址会变成 ')}
+              <code>{`http://127.0.0.1:${preview || '—'}`}</code>
+              {t('。已经把这个地址填进其它工具（Claude Code、Cherry Studio 等）的，需要一并改成新地址，否则那些工具会连不上。')}
             </p>
           </DialogSection>
 
@@ -622,7 +662,7 @@ function PortModal({ status, onClose }: PortModalProps) {
         <DialogFooter>
           <div className='mr-auto' />
           <Button variant='outline' onClick={onClose}>
-            取消
+            {t('取消')}
           </Button>
           <Button variant='default' disabled={phase !== 'idle'} onClick={() => void handleSave()}>
             {SAVE_LABELS[phase]}

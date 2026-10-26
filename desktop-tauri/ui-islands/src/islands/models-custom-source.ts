@@ -6,10 +6,10 @@
  *
  *   1. **取数**：把该家记录（`models` / `mappings` 两个数组）适配成与
  *      `GET /api/models/manage` 同形的 `{models, mappings}` —— 于是表格渲染、搜索、
- *      映射 chip、思考等级、列设置全部照用，一行都不用为自定义家另写；
+ *      映射 chip、思考等级、能力位两列、列设置全部照用，一行都不用为自定义家另写；
  *   2. **写入**：该家没有逐条接口，只有「整表替换」（`POST /api/custom-providers/models`）。
  *      每次操作都「读当前记录 → 应用这一处改动 → 提交全量 → 刷新目录缓存」，于是界面上
- *      的每一步（开关 / 别名 / 思考等级 / 移除）都**立即生效**，没有保存按钮、没有草稿态；
+ *      的每一步（开关 / 别名 / 思考等级 / 能力位 / 移除）都**立即生效**，没有保存按钮、没有草稿态；
  *   3. **拉取**：`fetch-models` 由服务端代拉上游清单，新模型并入后同样走整表提交。
  *
  * ── 为什么在模型管理页里做适配，而不是把自定义家并进后端 manage_view ──
@@ -28,6 +28,9 @@
  * 刷新，本模块不自己发 GET，只在写入成功后 `refreshCustom()` 一次。
  */
 
+import { CAPABILITY_KEYS, normalizeCapabilities } from './model-capability'
+import { t } from '../i18n'
+
 /* ─── 对外数据类型（表格同形数据，models-page.tsx 也读这几个类型）────── */
 
 /** 一行模型（后端 `catalog::manage_view` 的 models[] 与本模块的适配结果同形） */
@@ -43,6 +46,30 @@ export type ManageModel = {
   /** 家级字段：这家清单的最近拉取时刻（毫秒，0 = 未知）；自定义家没有 */
   refreshedAt?: unknown
   credits?: unknown
+  /**
+   * 对下游声明的能力位（生效值：清单原值 + 用户覆盖）。内置家由后端给
+   * 「五键齐全、null = 未声明」的形状；自定义家由本模块适配成**稀疏表**
+   * （没填的键不出现）—— 读侧统一走 `model-capability` 的归一/判定，
+   * 两种形状不会分叉。
+   */
+  capabilities?: unknown
+  /** 被用户覆盖过的能力键（只有内置家给；自定义家的一切都是用户填的，恒空） */
+  capOverrides?: unknown
+  /**
+   * 每个能力键的**来源**（`{键: 'upstream' | 'modelsdev' | 'user'}`，缺的键 =
+   * 那一项没有来源）。管理页据此把「上游实测 / 社区库补的 / 用户改的」分开显示 ——
+   * 三个值长得一样、可信度差着量级（见 `core::model_meta` 的模块头）。
+   */
+  capSources?: unknown
+  /**
+   * 模型**自己能配哪些思考档位**（出口键名，由后端在清单成型处归一：这家自己
+   * 声明的 > models.dev 的 effort 列表；缺失 = 未声明，界面回落通用档位表）。
+   * **只读**，不参与保存：用户能改的是「某条映射用哪一档」
+   * （`ManageMapping.reasoning`），改不了上游认哪几个档位。
+   */
+  reasoningLevels?: unknown
+  /** 默认思考档位（与 `reasoningLevels` 同源；缺失 = 未声明） */
+  reasoningDefaultLevel?: unknown
 }
 
 /** 一条映射（含表格现造的默认绑定：alias == target） */
@@ -70,7 +97,8 @@ export type CustomProviderRecord = {
   id?: string
   name?: string
   createdAt?: unknown
-  models?: Array<{ id?: unknown; enabled?: unknown; reasoning?: unknown }>
+  /** `capabilities` 是该条模型的能力位覆盖（可选稀疏表，键名见 `model-capability`） */
+  models?: Array<{ id?: unknown; enabled?: unknown; reasoning?: unknown; capabilities?: unknown }>
   mappings?: Array<{ alias?: unknown; target?: unknown; enabled?: unknown; reasoning?: unknown }>
 }
 
@@ -117,6 +145,18 @@ export function list(): CustomProviderRecord[] {
   return (shared().wbProviders?.customList?.() || []).filter(provider => isCustom(provider?.id))
 }
 
+/**
+ * 目录缓存的**原始引用**（不拷贝、不过滤）：聚合视图按它判「缓存换没换」。
+ *
+ * providers.js 每次 fetchCustomProviders 都把 customItems 整份换新对象，所以
+ * 引用相等 = 目录没变 = 聚合缓存仍有效；引用一变缓存即失效重建。这是聚合视图
+ * 唯一可靠的失效信号 —— 记录内容是运行期数据，逐条比对既贵又漏（新增 / 删除
+ * 家、改模型清单都会换引用，全都该重建）。
+ */
+export function listSource(): readonly CustomProviderRecord[] {
+  return shared().wbProviders?.customList?.() || []
+}
+
 /** 取一家（不存在返回 null —— 可能刚被别处删掉） */
 export function record(id: string): CustomProviderRecord | null {
   return list().find(provider => provider.id === id) || null
@@ -130,13 +170,36 @@ export function record(id: string): CustomProviderRecord | null {
  * 每次提交都从**目录缓存的当前值**重建，所以本函数是幂等的：连点两次开关，第二次读到
  * 的就是第一次提交后的值。
  */
-function draftOf(provider: CustomProviderRecord | null): { models: Array<{ id: string; enabled: boolean; reasoning: string }>; mappings: Array<{ alias: string; target: string; enabled: boolean; reasoning: string }> } {
+type DraftModel = { id: string; enabled: boolean; reasoning: string; capabilities?: Record<string, number | boolean> }
+type DraftMapping = { alias: string; target: string; enabled: boolean; reasoning: string }
+
+/**
+ * 记录条目的能力位 → 可提交的稀疏对象（空表给 `undefined`：整表提交里不带
+ * 这个键，与后端「空表不落键」的口径一致）。
+ */
+function sparseCapabilities(value: unknown): Record<string, number | boolean> | undefined {
+  const normalized = normalizeCapabilities(value)
+  const result: Record<string, number | boolean> = {}
+  for (const key of CAPABILITY_KEYS) {
+    const item = normalized[key]
+    if (typeof item === 'number' || typeof item === 'boolean') result[key] = item
+  }
+  return Object.keys(result).length ? result : undefined
+}
+
+function draftOf(provider: CustomProviderRecord | null): { models: DraftModel[]; mappings: DraftMapping[] } {
   const models = (Array.isArray(provider?.models) ? provider.models : [])
-    .map(model => ({
-      id: String(model?.id ?? '').trim(),
-      enabled: model?.enabled !== false,
-      reasoning: typeof model?.reasoning === 'string' ? model.reasoning : '',
-    }))
+    .map(model => {
+      const draft: DraftModel = {
+        id: String(model?.id ?? '').trim(),
+        enabled: model?.enabled !== false,
+        reasoning: typeof model?.reasoning === 'string' ? model.reasoning : '',
+      }
+      // 能力位覆盖**必须原样带回**：整表替换的语义下，草稿漏了它，用户填过的
+      // 能力就会被一次「切开关」的提交顺手清掉
+      draft.capabilities = sparseCapabilities(model?.capabilities)
+      return draft
+    })
     .filter(model => model.id)
   const mappings = (Array.isArray(provider?.mappings) ? provider.mappings : [])
     .map(mapping => ({
@@ -162,9 +225,11 @@ function draftOf(provider: CustomProviderRecord | null): { models: Array<{ id: s
  * 目录记录 → 表格同形数据。返回 `null` = 这家已不存在（被别处删掉了）。
  *
  * 形状与后端 `catalog::manage_view` 逐字对齐，模型管理页的渲染只认这些字段：
- *   · models: `{id, name, provider, providerLabel, source, enabled, aliases}`
+ *   · models: `{id, name, provider, providerLabel, source, enabled, aliases,
+ *     capabilities, capOverrides}`
  *     —— 自定义家没有倍率与来源概念，`source` 留空串（选中自定义家时那两列本来就按
- *     视图隐藏，见 models-page 的 visibleColumns）；
+ *     视图隐藏，见 models-page 的 visibleColumns）；能力位是**记录自带**的稀疏表，
+ *     `capOverrides` 恒空（没有「上游原值」这回事，见 `setCapabilities`）；
  *   · mappings: `{alias, target, provider, enabled, reasoning, isDefault, dangling, carried}`
  *     —— 默认绑定（alias == target）由模型行现造，与内置家一致。
  */
@@ -184,6 +249,10 @@ export function buildView(id: string): { models: ManageModel[]; mappings: Manage
       source: '',
       enabled: model.enabled,
       aliases: [],
+      // 能力位是**记录自带的**（用户填的），没有「上游原值」这回事 ——
+      // 覆盖标记恒空，弹窗按「未声明 / 已填」两态呈现
+      capabilities: model.capabilities || {},
+      capOverrides: [],
     })
     mappings.push({
       alias: model.id,
@@ -224,9 +293,9 @@ export function buildView(id: string): { models: ManageModel[]; mappings: Manage
  */
 async function submit<T>(id: string, mutate: (draft: ReturnType<typeof draftOf>) => T): Promise<T> {
   const providers = shared().wbProviders
-  if (!providers?.customRequest) throw new Error('目录模块未就绪')
+  if (!providers?.customRequest) throw new Error(t('目录模块未就绪'))
   const provider = record(id)
-  if (!provider) throw new Error('该自定义提供商已不存在（可能已被删除），请刷新后重试')
+  if (!provider) throw new Error(t('该自定义提供商已不存在（可能已被删除），请刷新后重试'))
   const draft = draftOf(provider)
   const result = mutate(draft)
   await providers.customRequest('POST', '/api/custom-providers/models', {
@@ -253,7 +322,7 @@ export async function setBinding(id: string, alias: string, target: string, patc
   await submit(id, draft => {
     if (same(alias, target)) {
       const model = draft.models.find(item => same(item.id, target))
-      if (!model) throw new Error(`该提供商的清单里没有模型「${target}」`)
+      if (!model) throw new Error(t('该提供商的清单里没有模型「{name}」', { name: target }))
       if (enabled !== undefined) model.enabled = Boolean(enabled)
       if (reasoning !== undefined) model.reasoning = String(reasoning ?? '')
       return null
@@ -264,7 +333,7 @@ export async function setBinding(id: string, alias: string, target: string, patc
       if (reasoning !== undefined) existing.reasoning = String(reasoning ?? '')
       return null
     }
-    if (enabled === false) throw new Error(`映射「${alias} → ${target}」不存在`)
+    if (enabled === false) throw new Error(t('映射「{alias} → {target}」不存在', { alias, target }))
     draft.mappings.push({
       alias,
       target,
@@ -281,7 +350,7 @@ export async function removeMapping(id: string, alias: string, target: string): 
   await submit(id, draft => {
     const before = draft.mappings.length
     draft.mappings = draft.mappings.filter(item => !(same(item.alias, alias) && same(item.target, target)))
-    if (draft.mappings.length === before) throw new Error(`映射「${alias} → ${target}」不存在`)
+    if (draft.mappings.length === before) throw new Error(t('映射「{alias} → {target}」不存在', { alias, target }))
     return null
   })
 }
@@ -289,10 +358,10 @@ export async function removeMapping(id: string, alias: string, target: string): 
 /** 登记一个模型（手动添加走它，判重口径与内置家一致） */
 export async function addModel(id: string, modelId: string): Promise<void> {
   const value = String(modelId ?? '').trim()
-  if (!value) throw new Error('请填写模型 ID')
+  if (!value) throw new Error(t('请填写模型 ID'))
   await submit(id, draft => {
     if (draft.models.some(model => same(model.id, value))) {
-      throw new Error(`模型「${value}」已存在（忽略大小写判重）`)
+      throw new Error(t('模型「{name}」已存在（忽略大小写判重）', { name: value }))
     }
     draft.models.push({ id: value, enabled: true, reasoning: '' })
     return null
@@ -308,7 +377,7 @@ export async function addModels(id: string, modelIds: readonly unknown[]): Promi
   const values = (Array.isArray(modelIds) ? modelIds : [])
     .map(value => String(value ?? '').trim())
     .filter(Boolean)
-  if (!values.length) throw new Error('没有选中任何模型')
+  if (!values.length) throw new Error(t('没有选中任何模型'))
   return submit(id, draft => {
     let added = 0
     for (const value of values) {
@@ -317,6 +386,33 @@ export async function addModels(id: string, modelIds: readonly unknown[]): Promi
       added++
     }
     return added
+  })
+}
+
+/**
+ * 覆盖某条模型的能力位（自定义家的实现；内置家走 `writeCapabilities` 的
+ * `POST /api/models/capabilities`）。
+ *
+ * 自定义家的能力存在**提供商记录的 models[] 条目**里（与启停 / 思考等级同一处
+ * 存储），于是写入照那条既有路径：读当前记录 → 改这一条的字段 → 整表提交。
+ * `patch` 的三态与后端一致：键缺失 = 不改、`null` = 清除这一项、有值 = 覆盖；
+ * 清到一项不剩时整份 capabilities 键一并摘掉（与后端「空表不落键」同一口径）。
+ */
+export async function setCapabilities(
+  id: string,
+  modelId: string,
+  patch: Record<string, number | boolean | null>,
+): Promise<void> {
+  await submit(id, draft => {
+    const model = draft.models.find(item => same(item.id, modelId))
+    if (!model) throw new Error(t('该提供商的清单里没有模型「{name}」', { name: modelId }))
+    const next: Record<string, number | boolean> = { ...(model.capabilities || {}) }
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === null || value === undefined) delete next[key]
+      else next[key] = value
+    }
+    model.capabilities = Object.keys(next).length ? next : undefined
+    return null
   })
 }
 
@@ -337,7 +433,7 @@ export async function removeModel(id: string, modelId: string): Promise<{ remove
  */
 export async function fetchModels(id: string): Promise<{ total: number; added: number }> {
   const providers = shared().wbProviders
-  if (!providers?.customRequest) throw new Error('目录模块未就绪')
+  if (!providers?.customRequest) throw new Error(t('目录模块未就绪'))
   const data = await providers.customRequest('POST', '/api/custom-providers/fetch-models', { providerId: id })
   const ids = (Array.isArray(data?.models) ? data.models : [])
     .map(value => String(value ?? '').trim())
@@ -359,6 +455,7 @@ export async function fetchModels(id: string): Promise<{ total: number; added: n
 export type CustomSourceApi = {
   isCustom: typeof isCustom
   list: typeof list
+  listSource: typeof listSource
   record: typeof record
   buildView: typeof buildView
   setBinding: typeof setBinding
@@ -366,6 +463,7 @@ export type CustomSourceApi = {
   addModel: typeof addModel
   addModels: typeof addModels
   removeModel: typeof removeModel
+  setCapabilities: typeof setCapabilities
   fetchModels: typeof fetchModels
 }
 
@@ -381,6 +479,7 @@ export type CustomSourceApi = {
 shared().wbModelsCustom = {
   isCustom,
   list,
+  listSource,
   record,
   buildView,
   setBinding,
@@ -388,5 +487,6 @@ shared().wbModelsCustom = {
   addModel,
   addModels,
   removeModel,
+  setCapabilities,
   fetchModels,
 }
